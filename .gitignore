@@ -1,0 +1,19 @@
+# Beam files
+*.beam
+
+# Erlang core dump files
+erl_crash.dump
+
+# Rebar build artifacts
+rebar.lock
+_build/
+deps/
+
+# Logs and temporary files
+
+
+# Compiled documentation
+doc/*.html
+doc/*.css
+doc/*.png
+doc/edoc-info

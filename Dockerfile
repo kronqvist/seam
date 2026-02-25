@@ -64,8 +64,6 @@ RUN groupadd -g ${GROUP_ID} ${USERNAME} && \
 # Set the default user
 USER ${USERNAME}
 
-RUN ls
-
 # Install Claude - must be installed after switching to user
 RUN curl -fsSL https://claude.ai/install.sh | bash
 

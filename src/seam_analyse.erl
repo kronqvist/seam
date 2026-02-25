@@ -1,3 +1,8 @@
+%% @doc Coverage metrics computed from `seam_track' data.
+%%
+%% Condition summary, decision summary, untested condition detection, and
+%% MC/DC independence pair computation. All functions are pure queries over
+%% the ETS tables — no side effects.
 -module(seam_analyse).
 -include("seam.hrl").
 
@@ -5,7 +10,7 @@
 -export([untested_conditions/1]).
 -export([mcdc_coverage/1]).
 
-%% Fraction of conditions evaluated both true and false.
+%% @doc Count of conditions evaluated both true and false vs total conditions.
 -spec condition_summary(module()) -> {Covered :: non_neg_integer(),
                                        Total :: non_neg_integer()}.
 condition_summary(Mod) ->
@@ -19,7 +24,7 @@ condition_summary(Mod) ->
     end, 0, Cov),
     {Covered, Total}.
 
-%% Fraction of decisions with both success and failure observed.
+%% @doc Count of decisions observed both succeeding and failing vs total decisions.
 -spec decision_summary(module()) -> {Covered :: non_neg_integer(),
                                       Total :: non_neg_integer()}.
 decision_summary(Mod) ->
@@ -33,7 +38,7 @@ decision_summary(Mod) ->
     end, 0, Dec),
     {Covered, Total}.
 
-%% Conditions never evaluated true, never false, or both.
+%% @doc Conditions stuck on one side: never true or never false.
 -spec untested_conditions(module()) -> [{cond_key(), never_true | never_false}].
 untested_conditions(Mod) ->
     Cov = seam_track:conditions(Mod),
@@ -45,7 +50,9 @@ untested_conditions(Mod) ->
         end
     end, [], Cov).
 
-%% Compute MC/DC pairs from collected test vectors.
+%% @doc Compute MC/DC independence pairs from collected test vectors.
+%% Return `{error, not_collected}' if no vectors exist for `Mod'.
+%% Each condition maps to `satisfied' or `unsatisfied'.
 -spec mcdc_coverage(module()) -> {ok, map()} | {error, not_collected}.
 mcdc_coverage(Mod) ->
     case ets:whereis(?SEAM_VECTORS) of

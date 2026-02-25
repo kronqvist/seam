@@ -1,9 +1,23 @@
+%% @doc AST transformation for condition-level instrumentation.
+%%
+%% Extract abstract code from a BEAM file via `beam_lib', walk every
+%% function clause, and inject `seam_track' calls into clause bodies that
+%% record each guard condition's true/false outcome. Guards themselves are
+%% never modified — Erlang restricts guard expressions to BIFs.
+%%
+%% For the matched clause, all its guard conditions are recorded as true.
+%% For prior (failed) clauses, their conditions are re-evaluated in
+%% try/catch blocks using variable substitution from the current clause's
+%% pattern bindings. Wildcard patterns are replaced with fresh variables
+%% to enable this re-evaluation.
 -module(seam_instrument).
 -include("seam.hrl").
 
 -export([compile_beam/1]).
 
-%% Instrument a module's BEAM and load the result.
+%% @doc Instrument a module and hot-load the result. Accept a module atom
+%% (must already be loaded) or a path to a `.beam' file. Requires
+%% `debug_info'. Stashes the original binary for restoration.
 -spec compile_beam(module() | string()) -> {ok, module()} | {error, term()}.
 compile_beam(ModOrPath) ->
     case resolve_beam(ModOrPath) of

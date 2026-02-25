@@ -1,3 +1,8 @@
+%% @doc Public API for Seam condition-level coverage.
+%%
+%% Thin facade over `seam_instrument', `seam_track', `seam_analyse', and
+%% `seam_report'. Start the server, instrument modules, exercise them,
+%% then query or export the results.
 -module(seam).
 -include("seam.hrl").
 
@@ -8,7 +13,7 @@
 -export([report/2]).
 -export([export/1, import/1]).
 
-%% Initialize tracking tables. Idempotent.
+%% @doc Create ETS tracking tables. Idempotent.
 -spec start() -> ok.
 start() ->
     case ets:whereis(?SEAM_CONDITIONS) of
@@ -16,43 +21,50 @@ start() ->
         _ -> ok
     end.
 
-%% Restore original modules, destroy tables.
+%% @doc Restore all instrumented modules to their originals and destroy ETS tables.
 -spec stop() -> ok.
 stop() ->
     lists:foreach(fun restore_module/1, seam_track:modules()),
     seam_track:destroy().
 
-%% Zero all counters.
+%% @doc Zero all condition, decision, and vector counters. Table structure preserved.
 -spec reset() -> ok.
 reset() ->
     seam_track:reset().
 
-%% Instrument and load a module.
+%% @doc Instrument a module and hot-load the result. Accept a module atom
+%% (must be loaded with `debug_info') or a path to a `.beam' file.
+%% The original binary is stashed for restoration by `stop/0'.
 -spec compile_beam(module() | string()) -> {ok, module()} | {error, term()}.
 compile_beam(ModOrPath) ->
     seam_instrument:compile_beam(ModOrPath).
 
-%% Condition coverage for a module: #{cond_key() => {TrueCnt, FalseCnt}}.
--spec condition_coverage(module()) -> map().
+%% @doc Return condition coverage for `Mod'.
+%% Result: `#{cond_key() => {TrueCount, FalseCount}}'.
+-spec condition_coverage(module()) -> #{cond_key() => {non_neg_integer(), non_neg_integer()}}.
 condition_coverage(Mod) ->
     seam_track:conditions(Mod).
 
-%% Decision coverage for a module: #{decision_key() => {SuccessCnt, FailureCnt}}.
--spec decision_coverage(module()) -> map().
+%% @doc Return decision coverage for `Mod'.
+%% Result: `#{decision_key() => {SuccessCount, FailureCount}}'.
+-spec decision_coverage(module()) -> #{decision_key() => {non_neg_integer(), non_neg_integer()}}.
 decision_coverage(Mod) ->
     seam_track:decisions(Mod).
 
-%% Cover-compatible analyse interface.
+%% @doc Query coverage by level. `condition' and `decision' correspond to
+%% the two coverage maps.
 -spec analyse(module(), condition | decision) -> {ok, map()}.
 analyse(Mod, condition) -> {ok, condition_coverage(Mod)};
 analyse(Mod, decision)  -> {ok, decision_coverage(Mod)}.
 
-%% Generate a coverage report.
+%% @doc Generate a coverage report as an iolist. `text' for plain text,
+%% `html' for source-annotated HTML.
 -spec report(module(), text | html) -> iolist().
 report(Mod, text) -> seam_report:text(Mod);
 report(Mod, html) -> seam_report:html(Mod).
 
-%% Export coverage data to file.
+%% @doc Serialize all coverage data to `Path' as a binary term. Merge later
+%% with {@link import/1}.
 -spec export(string()) -> ok | {error, term()}.
 export(Path) ->
     Data = #{conditions => seam_track:conditions(),
@@ -60,7 +72,8 @@ export(Path) ->
              modules    => seam_track:modules()},
     file:write_file(Path, term_to_binary(Data)).
 
-%% Import and merge coverage data from file.
+%% @doc Read coverage data from `Path' and merge into current counters.
+%% Commutative.
 -spec import(string()) -> ok | {error, term()}.
 import(Path) ->
     case file:read_file(Path) of

@@ -1,9 +1,15 @@
+%% @doc Coverage report generation.
+%%
+%% Plain-text summaries and source-annotated HTML reports. The HTML report
+%% follows `cover:analyse_to_file/2' conventions: a three-column table
+%% (line number, annotations, source) with colour-coded rows. Guard lines
+%% carry per-condition badges showing true/false counts.
 -module(seam_report).
 -include("seam.hrl").
 
 -export([text/1, html/1, html_to_file/2]).
 
-%% Plain-text coverage report for a module.
+%% @doc Plain-text coverage summary for `Mod'.
 -spec text(module()) -> iolist().
 text(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
@@ -31,7 +37,7 @@ format_untested_item({{Mod, Fun, Clause, Cond}, Status}) ->
     io_lib:format("  ~s:~s/clause ~p, condition ~p -- ~s~n",
                   [Mod, Fun, Clause, Cond, StatusStr]).
 
-%% Source-annotated HTML report.
+%% @doc Source-annotated HTML report with per-condition badges and colour-coded lines.
 -spec html(module()) -> iolist().
 html(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
@@ -47,7 +53,7 @@ html(Mod) ->
      source_table(SrcLines, ByLine),
      html_footer()].
 
-%% Write HTML report to file.
+%% @doc Write the HTML report for `Mod' to `Path'.
 -spec html_to_file(module(), string()) -> ok | {error, term()}.
 html_to_file(Mod, Path) ->
     file:write_file(Path, html(Mod)).

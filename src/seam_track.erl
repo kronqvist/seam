@@ -1,3 +1,9 @@
+%% @doc Runtime storage for coverage data.
+%%
+%% Owns five named ETS tables: conditions, decisions, MC/DC vectors,
+%% module metadata, and condition metadata. All counter updates use
+%% `ets:update_counter/4' for atomicity under concurrent access. Called
+%% directly by instrumented code at runtime — keep the hot path minimal.
 -module(seam_track).
 -include("seam.hrl").
 
@@ -7,7 +13,7 @@
 -export([modules/0, register_module/2, unregister_module/1]).
 -export([register_meta/3, meta/1]).
 
-%% Create all ETS tables. Call once at startup.
+%% @doc Create all ETS tables. Call once at startup.
 -spec init() -> ok.
 init() ->
     Opts = [named_table, public, set, {write_concurrency, true}],
@@ -18,7 +24,7 @@ init() ->
     ets:new(?SEAM_META,       [named_table, public, set]),
     ok.
 
-%% Drop all ETS tables.
+%% @doc Drop all ETS tables.
 -spec destroy() -> ok.
 destroy() ->
     lists:foreach(fun(T) ->
@@ -26,7 +32,7 @@ destroy() ->
     end, [?SEAM_CONDITIONS, ?SEAM_DECISIONS, ?SEAM_MODULES, ?SEAM_VECTORS, ?SEAM_META]),
     ok.
 
-%% Zero all counters; preserve table structure.
+%% @doc Zero all counters. Table structure preserved.
 -spec reset() -> ok.
 reset() ->
     ets:delete_all_objects(?SEAM_CONDITIONS),
@@ -34,70 +40,72 @@ reset() ->
     ets:delete_all_objects(?SEAM_VECTORS),
     ok.
 
-%% Record a single condition evaluation. Atomic increment.
+%% @doc Record a condition evaluation. Atomic increment. Return `Result'
+%% unchanged (passthrough).
 -spec record(cond_key(), boolean()) -> boolean().
 record(Key, Result) ->
     ets:update_counter(?SEAM_CONDITIONS,
         {Key, Result}, {2, 1}, {{Key, Result}, 0}),
     Result.
 
-%% Record a decision (whole guard) outcome. Atomic increment.
+%% @doc Record a decision (whole guard) outcome. Atomic increment. Passthrough.
 -spec record_decision(decision_key(), boolean()) -> boolean().
 record_decision(Key, Result) ->
     ets:update_counter(?SEAM_DECISIONS,
         {Key, Result}, {2, 1}, {{Key, Result}, 0}),
     Result.
 
-%% Store a full test vector for MC/DC analysis.
+%% @doc Store a full test vector for post-hoc MC/DC analysis.
 -spec record_vector(decision_key(), [boolean()], boolean()) -> ok.
 record_vector(DecKey, CondVals, Outcome) ->
     ets:insert(?SEAM_VECTORS, {DecKey, CondVals, Outcome}),
     ok.
 
-%% Return all condition coverage as a map.
+%% @doc All condition coverage as `#{cond_key() => {TrueCount, FalseCount}}'.
 -spec conditions() -> #{cond_key() => {non_neg_integer(), non_neg_integer()}}.
 conditions() ->
     fold_pairs(?SEAM_CONDITIONS).
 
-%% Condition coverage for a single module.
+%% @doc Condition coverage filtered to a single module.
 -spec conditions(module()) -> #{cond_key() => {non_neg_integer(), non_neg_integer()}}.
 conditions(Mod) ->
     maps:filter(fun({M, _, _, _}, _) -> M =:= Mod end, conditions()).
 
-%% Return all decision coverage as a map.
+%% @doc All decision coverage as `#{decision_key() => {SuccessCount, FailureCount}}'.
 -spec decisions() -> #{decision_key() => {non_neg_integer(), non_neg_integer()}}.
 decisions() ->
     fold_pairs(?SEAM_DECISIONS).
 
-%% Decision coverage for a single module.
+%% @doc Decision coverage filtered to a single module.
 -spec decisions(module()) -> #{decision_key() => {non_neg_integer(), non_neg_integer()}}.
 decisions(Mod) ->
     maps:filter(fun({M, _, _}, _) -> M =:= Mod end, decisions()).
 
-%% Register an instrumented module, stashing its original BEAM binary.
+%% @doc Stash the original BEAM binary for later restoration by {@link seam:stop/0}.
 -spec register_module(module(), binary()) -> ok.
 register_module(Mod, OrigBeam) ->
     ets:insert(?SEAM_MODULES, {Mod, OrigBeam}),
     ok.
 
-%% Remove a module from tracking.
+%% @doc Remove a module from the tracked set.
 -spec unregister_module(module()) -> ok.
 unregister_module(Mod) ->
     ets:delete(?SEAM_MODULES, Mod),
     ok.
 
-%% All tracked modules.
+%% @doc List all currently instrumented modules.
 -spec modules() -> [module()].
 modules() ->
     [M || {M, _} <- ets:tab2list(?SEAM_MODULES)].
 
-%% Store condition metadata: {CondKey, Line, ExprString}.
+%% @doc Store condition metadata (source line and expression text) for
+%% report generation.
 -spec register_meta(cond_key(), pos_integer(), string()) -> ok.
 register_meta(Key, Line, ExprStr) ->
     ets:insert(?SEAM_META, {Key, Line, ExprStr}),
     ok.
 
-%% Retrieve all metadata for a module: [{CondKey, Line, ExprStr}].
+%% @doc Retrieve all condition metadata for a module.
 -spec meta(module()) -> [{cond_key(), pos_integer(), string()}].
 meta(Mod) ->
     ets:foldl(fun({{M, _, _, _} = K, Line, Expr}, Acc) when M =:= Mod ->
@@ -107,7 +115,6 @@ meta(Mod) ->
 
 %%% Internal
 
-%% Fold ETS entries of form {{Key, Bool}, Count} into #{Key => {True, False}}.
 fold_pairs(Tab) ->
     ets:foldl(fun({{Key, true}, Cnt}, Acc) ->
         maps:update_with(Key,

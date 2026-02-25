@@ -1,0 +1,51 @@
+@title Seam: Condition-Level Coverage for Erlang
+@doc
+
+Seam instruments BEAM bytecode to track individual Boolean conditions
+in guards, case expressions, and if clauses. Where OTP's `cover' counts
+line executions, Seam counts how many times each condition evaluated
+true and how many times false — the granularity needed to guide
+mutation testing, fuzzing, and property-based test generation.
+
+<h3>Architecture</h3>
+
+Five modules, one responsibility each:
+
+<ul>
+<li>{@link seam} — Public API. Start/stop the coverage server,
+instrument modules, query results.</li>
+<li>{@link seam_instrument} — AST transformation. Extract abstract code
+from BEAM, rewrite clauses to record guard condition outcomes,
+recompile and load.</li>
+<li>{@link seam_track} — Runtime storage. ETS tables for condition counts,
+decision counts, MC/DC vectors, and module metadata. All updates are
+atomic.</li>
+<li>{@link seam_analyse} — Metrics. Condition and decision summary
+percentages, untested condition detection, MC/DC independence pair
+computation.</li>
+<li>{@link seam_report} — Output. Plain-text and source-annotated HTML
+reports with per-condition badges.</li>
+</ul>
+
+<h3>Instrumentation strategy</h3>
+
+Erlang guards permit only BIF calls, so Seam cannot inject tracking
+directly into guard expressions. Instead it keeps guards unmodified and
+records outcomes in the clause body. When clause N matches, Seam records
+all of clause N's guard conditions as true and re-evaluates prior
+clauses' conditions (via try/catch with variable substitution) to
+capture the false data. Wildcard patterns are replaced with fresh
+variables to make re-evaluation possible.
+
+<h3>Coverage levels</h3>
+
+<ul>
+<li><em>Condition coverage</em> — each Boolean sub-expression tracked
+independently, keyed by `{Module, Function, ClauseIndex,
+ConditionIndex}'.</li>
+<li><em>Decision coverage</em> — each guard as a whole (did clause N's
+guard succeed or fail?), keyed by `{Module, Function,
+ClauseIndex}'.</li>
+<li><em>MC/DC</em> (optional) — Modified Condition/Decision Coverage
+computed post-hoc from collected test vectors.</li>
+</ul>
