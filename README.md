@@ -11,10 +11,8 @@ Mutation testers, fuzzers, and property-based test generators need denser
 feedback: which individual Boolean conditions have been exercised both ways, and
 which remain stuck on one side.
 
-Smother (Ramsay, 2014) solved this for Erlang R16 with MC/DC instrumentation.
-It is unmaintained. Seam is a modern reimplementation of the core idea — BEAM
-bytecode instrumentation at the condition level — optimized for test generation
-feedback rather than certification compliance.
+Seam instruments BEAM bytecode at the condition level, optimized for test
+generation feedback rather than certification compliance.
 
 ## How it works
 
