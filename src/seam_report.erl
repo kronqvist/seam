@@ -1,6 +1,7 @@
 -module(seam_report).
+-include("seam.hrl").
 
--export([text/1, html/1]).
+-export([text/1, html/1, html_to_file/2]).
 
 %% Plain-text coverage report for a module.
 -spec text(module()) -> iolist().
@@ -30,45 +31,188 @@ format_untested_item({{Mod, Fun, Clause, Cond}, Status}) ->
     io_lib:format("  ~s:~s/clause ~p, condition ~p -- ~s~n",
                   [Mod, Fun, Clause, Cond, StatusStr]).
 
-%% HTML coverage report with colour-coded summary.
+%% Source-annotated HTML report.
 -spec html(module()) -> iolist().
 html(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
     {DecCov, DecTotal} = seam_analyse:decision_summary(Mod),
-    Untested = seam_analyse:untested_conditions(Mod),
     CondPct = pct(CondCov, CondTotal),
     DecPct = pct(DecCov, DecTotal),
-    ["<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">\n",
-     "<title>Seam: ", atom_to_list(Mod), "</title>\n",
-     "<style>",
-     "body{font-family:monospace;margin:2em}",
-     ".green{color:#080} .red{color:#a00} .yellow{color:#a80}",
-     "table{border-collapse:collapse} td,th{padding:4px 12px;border:1px solid #ccc}",
-     "</style></head><body>\n",
-     "<h2>Seam Coverage: ", atom_to_list(Mod), "</h2>\n",
-     "<table><tr><th>Metric</th><th>Covered</th><th>Total</th><th>%</th></tr>\n",
-     row("Condition", CondCov, CondTotal, CondPct),
-     row("Decision", DecCov, DecTotal, DecPct),
-     "</table>\n",
-     html_untested(Untested),
-     "</body></html>\n"].
+    Cov = seam_track:conditions(Mod),
+    Meta = seam_track:meta(Mod),
+    ByLine = group_meta_by_line(Meta, Cov),
+    SrcLines = read_source(Mod),
+    [html_header(Mod),
+     summary_table(CondCov, CondTotal, CondPct, DecCov, DecTotal, DecPct),
+     source_table(SrcLines, ByLine),
+     html_footer()].
 
-row(Label, Cov, Total, Pct) ->
+%% Write HTML report to file.
+-spec html_to_file(module(), string()) -> ok | {error, term()}.
+html_to_file(Mod, Path) ->
+    file:write_file(Path, html(Mod)).
+
+%%% Source reading
+
+read_source(Mod) ->
+    case find_source(Mod) of
+        {ok, Path} ->
+            case file:read_file(Path) of
+                {ok, Bin} -> string:split(binary_to_list(Bin), "\n", all);
+                _ -> []
+            end;
+        error -> []
+    end.
+
+find_source(Mod) ->
+    case code:which(Mod) of
+        Path when is_list(Path) ->
+            %% Try to find source from beam info
+            case beam_lib:chunks(Path, [compile_info]) of
+                {ok, {Mod, [{compile_info, Info}]}} ->
+                    case proplists:get_value(source, Info) of
+                        undefined -> guess_source(Mod);
+                        Src -> check_exists(Src, Mod)
+                    end;
+                _ -> guess_source(Mod)
+            end;
+        _ -> guess_source(Mod)
+    end.
+
+check_exists(Path, Mod) ->
+    case filelib:is_file(Path) of
+        true -> {ok, Path};
+        false -> guess_source(Mod)
+    end.
+
+guess_source(Mod) ->
+    Name = atom_to_list(Mod) ++ ".erl",
+    Candidates = ["src/" ++ Name, "test/targets/" ++ Name, Name],
+    case lists:dropwhile(fun(P) -> not filelib:is_file(P) end, Candidates) of
+        [P | _] -> {ok, P};
+        [] -> error
+    end.
+
+%%% Metadata grouping
+
+%% Build #{Line => [{CondKey, ExprStr, TrueCnt, FalseCnt}]}.
+group_meta_by_line(Meta, Cov) ->
+    lists:foldl(fun({Key, Line, ExprStr}, Acc) ->
+        {T, F} = maps:get(Key, Cov, {0, 0}),
+        Entry = {Key, ExprStr, T, F},
+        maps:update_with(Line, fun(L) -> L ++ [Entry] end, [Entry], Acc)
+    end, #{}, Meta).
+
+%%% HTML generation
+
+html_header(Mod) ->
+    ["<!DOCTYPE html>\n<html>\n<head>\n<meta charset=\"utf-8\">\n",
+     "<title>Seam: ", atom_to_list(Mod), "</title>\n",
+     "<style>\n", css(), "</style>\n",
+     "</head>\n<body>\n",
+     "<h1>Seam Coverage: <code>", atom_to_list(Mod), "</code></h1>\n"].
+
+html_footer() ->
+    "</body>\n</html>\n".
+
+css() ->
+    "body { font-family: system-ui, sans-serif; margin: 2em; }\n"
+    "h1 { font-size: 1.4em; }\n"
+    "h2 { font-size: 1.1em; margin-top: 2em; }\n"
+    "table.summary { border-collapse: collapse; margin-bottom: 2em; }\n"
+    "table.summary td, table.summary th { padding: 4px 14px; border: 1px solid #ccc; }\n"
+    "table.summary .green { color: #1a7f37; }\n"
+    "table.summary .yellow { color: #9a6700; }\n"
+    "table.summary .red { color: #cf222e; }\n"
+    "table.source { border-collapse: collapse; font-size: 13px; width: 100%; }\n"
+    "table.source td { padding: 0 8px; white-space: pre; font-family: monospace; }\n"
+    "table.source td.line { text-align: right; color: #888; border-right: 1px solid #ddd; "
+        "user-select: none; width: 1%; }\n"
+    "table.source td.line a { color: #888; text-decoration: none; }\n"
+    "table.source td.line a:hover { text-decoration: underline; }\n"
+    "tr.hit td.line { background: #cdffd8; }\n"
+    "tr.hit td.src  { background: #e6ffed; }\n"
+    "tr.miss td.line { background: #ffdce0; }\n"
+    "tr.miss td.src  { background: #ffeef0; }\n"
+    "tr.partial td.line { background: #fff3cd; }\n"
+    "tr.partial td.src  { background: #fff8e1; }\n"
+    "td.annot { font-size: 11px; color: #555; width: 1%; white-space: nowrap; }\n"
+    ".cond { display: inline-block; margin-right: 8px; padding: 1px 4px; "
+        "border-radius: 3px; font-size: 11px; }\n"
+    ".cond-full { background: #cdffd8; color: #1a7f37; }\n"
+    ".cond-partial { background: #fff3cd; color: #9a6700; }\n"
+    ".cond-none { background: #ffdce0; color: #cf222e; }\n".
+
+summary_table(CondCov, CondTotal, CondPct, DecCov, DecTotal, DecPct) ->
+    ["<table class=\"summary\">\n",
+     "<tr><th>Metric</th><th>Covered</th><th>Total</th><th>%</th></tr>\n",
+     summary_row("Condition", CondCov, CondTotal, CondPct),
+     summary_row("Decision", DecCov, DecTotal, DecPct),
+     "</table>\n"].
+
+summary_row(Label, Cov, Total, Pct) ->
     Class = colour_class(Pct),
     io_lib:format("<tr><td>~s</td><td>~p</td><td>~p</td>"
                   "<td class=\"~s\">~.1f%</td></tr>\n",
                   [Label, Cov, Total, Class, Pct]).
 
-html_untested([]) -> [];
-html_untested(Items) ->
-    ["<h3>Undertested Conditions</h3>\n<ul>\n",
-     [io_lib:format("<li class=\"red\">~s:~s/clause ~p, cond ~p &mdash; ~s</li>\n",
-                    [M, F, C, Cd, status_str(S)])
-      || {{M, F, C, Cd}, S} <- Items],
-     "</ul>\n"].
+source_table([], _ByLine) ->
+    "<p><em>Source file not found.</em></p>\n";
+source_table(SrcLines, ByLine) ->
+    ["<h2>Source</h2>\n",
+     "<table class=\"source\">\n<tbody>\n",
+     source_rows(SrcLines, ByLine, 1),
+     "</tbody>\n</table>\n"].
 
-status_str(never_true)  -> "never true";
-status_str(never_false) -> "never false".
+source_rows([], _ByLine, _N) -> [];
+source_rows([Line | Rest], ByLine, N) ->
+    Row = source_row(N, Line, maps:get(N, ByLine, [])),
+    [Row | source_rows(Rest, ByLine, N + 1)].
+
+source_row(N, Src, []) ->
+    %% Non-instrumented line
+    io_lib:format("<tr>"
+                  "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
+                  "<td class=\"annot\"></td>"
+                  "<td class=\"src\">~s</td>"
+                  "</tr>\n", [N, N, N, escape(Src)]);
+source_row(N, Src, Conditions) ->
+    Class = line_class(Conditions),
+    Annots = [cond_badge(C) || C <- Conditions],
+    io_lib:format("<tr class=\"~s\">"
+                  "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
+                  "<td class=\"annot\">~s</td>"
+                  "<td class=\"src\">~s</td>"
+                  "</tr>\n",
+                  [Class, N, N, N, Annots, escape(Src)]).
+
+line_class(Conditions) ->
+    AllFull = lists:all(fun({_, _, T, F}) -> T > 0 andalso F > 0 end, Conditions),
+    AnyHit = lists:any(fun({_, _, T, F}) -> T > 0 orelse F > 0 end, Conditions),
+    case {AllFull, AnyHit} of
+        {true, _} -> "hit";
+        {_, true} -> "partial";
+        _ -> "miss"
+    end.
+
+cond_badge({_Key, ExprStr, T, F}) ->
+    Class = case {T > 0, F > 0} of
+        {true, true}  -> "cond-full";
+        {true, false} -> "cond-partial";
+        {false, true} -> "cond-partial";
+        {false, false} -> "cond-none"
+    end,
+    Trimmed = string:trim(ExprStr),
+    io_lib:format("<span class=\"cond ~s\" title=\"true:~p false:~p\">~s</span>",
+                  [Class, T, F, escape(Trimmed)]).
+
+escape(Str) ->
+    lists:flatmap(fun($<) -> "&lt;";
+                     ($>) -> "&gt;";
+                     ($&) -> "&amp;";
+                     ($") -> "&quot;";
+                     (C)  -> [C]
+                  end, Str).
 
 colour_class(Pct) when Pct >= 80.0 -> "green";
 colour_class(Pct) when Pct >= 50.0 -> "yellow";

@@ -5,6 +5,7 @@
 -export([record/2, record_decision/2, record_vector/3]).
 -export([conditions/0, conditions/1, decisions/0, decisions/1]).
 -export([modules/0, register_module/2, unregister_module/1]).
+-export([register_meta/3, meta/1]).
 
 %% Create all ETS tables. Call once at startup.
 -spec init() -> ok.
@@ -14,6 +15,7 @@ init() ->
     ets:new(?SEAM_DECISIONS,  Opts),
     ets:new(?SEAM_MODULES,    [named_table, public, set]),
     ets:new(?SEAM_VECTORS,    [named_table, public, bag, {write_concurrency, true}]),
+    ets:new(?SEAM_META,       [named_table, public, set]),
     ok.
 
 %% Drop all ETS tables.
@@ -21,7 +23,7 @@ init() ->
 destroy() ->
     lists:foreach(fun(T) ->
         catch ets:delete(T)
-    end, [?SEAM_CONDITIONS, ?SEAM_DECISIONS, ?SEAM_MODULES, ?SEAM_VECTORS]),
+    end, [?SEAM_CONDITIONS, ?SEAM_DECISIONS, ?SEAM_MODULES, ?SEAM_VECTORS, ?SEAM_META]),
     ok.
 
 %% Zero all counters; preserve table structure.
@@ -88,6 +90,20 @@ unregister_module(Mod) ->
 -spec modules() -> [module()].
 modules() ->
     [M || {M, _} <- ets:tab2list(?SEAM_MODULES)].
+
+%% Store condition metadata: {CondKey, Line, ExprString}.
+-spec register_meta(cond_key(), pos_integer(), string()) -> ok.
+register_meta(Key, Line, ExprStr) ->
+    ets:insert(?SEAM_META, {Key, Line, ExprStr}),
+    ok.
+
+%% Retrieve all metadata for a module: [{CondKey, Line, ExprStr}].
+-spec meta(module()) -> [{cond_key(), pos_integer(), string()}].
+meta(Mod) ->
+    ets:foldl(fun({{M, _, _, _} = K, Line, Expr}, Acc) when M =:= Mod ->
+        [{K, Line, Expr} | Acc];
+    (_, Acc) -> Acc
+    end, [], ?SEAM_META).
 
 %%% Internal
 

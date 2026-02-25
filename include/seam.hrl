@@ -5,6 +5,7 @@
 -define(SEAM_DECISIONS,  seam_decisions).
 -define(SEAM_VECTORS,    seam_mcdc_vectors).
 -define(SEAM_MODULES,    seam_modules).
+-define(SEAM_META,       seam_meta).
 
 -type cond_key()     :: {module(), atom(), pos_integer(), pos_integer()}.
 -type decision_key() :: {module(), atom(), pos_integer()}.

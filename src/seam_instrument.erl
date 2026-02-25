@@ -211,7 +211,7 @@ subst_vars(Other, _Map) ->
 
 %%% === Guard condition extraction ===
 
-%% Condition keys for all conditions in a guard.
+%% Condition keys for all conditions in a guard. Also registers metadata.
 guard_cond_keys(Mod, Fun, ClauseIdx, Guards) ->
     {Keys, _} = lists:foldl(
         fun(Conj, {Acc, Idx}) ->
@@ -221,9 +221,27 @@ guard_cond_keys(Mod, Fun, ClauseIdx, Guards) ->
     Keys.
 
 conj_keys(_Mod, _Fun, _Clause, [], Idx) -> {[], Idx};
-conj_keys(Mod, Fun, Clause, [_ | Rest], Idx) ->
+conj_keys(Mod, Fun, Clause, [Test | Rest], Idx) ->
+    Key = {Mod, Fun, Clause, Idx},
+    Line = expr_line(Test),
+    ExprStr = expr_to_string(Test),
+    seam_track:register_meta(Key, Line, ExprStr),
     {RestKeys, NextIdx} = conj_keys(Mod, Fun, Clause, Rest, Idx + 1),
-    {[{Mod, Fun, Clause, Idx} | RestKeys], NextIdx}.
+    {[Key | RestKeys], NextIdx}.
+
+expr_line(Expr) ->
+    Anno = element(2, Expr),
+    case Anno of
+        N when is_integer(N) -> N;
+        {L, _} when is_integer(L) -> L;
+        _ when is_list(Anno) -> proplists:get_value(location, Anno, 0);
+        _ -> 0
+    end.
+
+expr_to_string(Expr) ->
+    try lists:flatten(erl_pp:expr(Expr))
+    catch _:_ -> ""
+    end.
 
 %% Flatten guards into a list of individual test expressions.
 flatten_guard_conds(Guards) ->
