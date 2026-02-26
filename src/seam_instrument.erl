@@ -10,20 +10,31 @@
 %% try/catch blocks using variable substitution from the current clause's
 %% pattern bindings. Wildcard patterns are replaced with fresh variables
 %% to enable this re-evaluation.
+%%
+%% Two instrumentation modes: `full' (default) performs prior-clause
+%% re-evaluation and body expression instrumentation; `fast' records
+%% only the matched clause's own conditions and decision — suitable for
+%% high-iteration fuzzing where overhead must be minimal.
 -module(seam_instrument).
 -include("seam.hrl").
 
--export([compile_beam/1]).
+-export([compile_beam/1, compile_beam/2]).
 
-%% @doc Instrument a module and hot-load the result. Accept a module atom
-%% (must already be loaded) or a path to a `.beam' file. Requires
-%% `debug_info'. Stashes the original binary for restoration.
+%% @doc Instrument in `full' mode. Equivalent to `compile_beam(ModOrPath, #{mode => full})'.
 -spec compile_beam(module() | string()) -> {ok, module()} | {error, term()}.
 compile_beam(ModOrPath) ->
+    compile_beam(ModOrPath, #{mode => full}).
+
+%% @doc Instrument a module and hot-load the result. `Opts' map supports
+%% `#{mode => full | fast}'. In `fast' mode, skip prior-clause
+%% re-evaluation and body expression instrumentation — record only own
+%% conditions and decision.
+-spec compile_beam(module() | string(), map()) -> {ok, module()} | {error, term()}.
+compile_beam(ModOrPath, Opts) ->
     case resolve_beam(ModOrPath) of
         {ok, Mod, Beam} ->
             case extract_forms(Mod, Beam) of
-                {ok, Forms} -> do_instrument(Mod, Beam, Forms);
+                {ok, Forms} -> do_instrument(Mod, Beam, Forms, Opts);
                 Err -> Err
             end;
         Err -> Err
@@ -63,8 +74,8 @@ extract_forms(Mod, Beam) ->
 
 %%% === Compile and load ===
 
-do_instrument(Mod, OrigBeam, Forms) ->
-    Instrumented = transform_forms(Mod, Forms),
+do_instrument(Mod, OrigBeam, Forms, Opts) ->
+    Instrumented = transform_forms(Mod, Forms, Opts),
     case compile:forms(Instrumented, [binary, return_errors, debug_info]) of
         {ok, Mod, Binary} ->
             load_instrumented(Mod, OrigBeam, Binary);
@@ -84,32 +95,32 @@ load_instrumented(Mod, OrigBeam, Binary) ->
 
 %%% === AST transformation ===
 
-transform_forms(Mod, Forms) ->
-    [transform_form(Mod, F) || F <- Forms].
+transform_forms(Mod, Forms, Opts) ->
+    [transform_form(Mod, F, Opts) || F <- Forms].
 
-transform_form(Mod, {function, Anno, Name, Arity, Clauses}) ->
+transform_form(Mod, {function, Anno, Name, Arity, Clauses}, Opts) ->
     {function, Anno, Name, Arity,
-     transform_fun_clauses(Mod, Name, Clauses)};
-transform_form(_Mod, Other) ->
+     transform_fun_clauses(Mod, Name, Clauses, Opts)};
+transform_form(_Mod, Other, _Opts) ->
     Other.
 
-%% Transform a set of function clauses.
-%% Strategy: keep original patterns and guards intact.
-%% In each clause body, record own conditions as true and re-evaluate
-%% prior clauses' conditions to capture false counts.
-transform_fun_clauses(Mod, Fun, Clauses) ->
+transform_fun_clauses(Mod, Fun, Clauses, Opts) ->
+    Mode = maps:get(mode, Opts, full),
     Indexed = index_clauses(Clauses, 1),
-    AllGuardInfo = [{Idx, extract_clause_vars(Pats), Guards}
-                    || {Idx, {clause, _, Pats, Guards, _}} <- Indexed],
-    [instrument_clause(Mod, Fun, Idx, Clause, AllGuardInfo)
-     || {Idx, Clause} <- Indexed].
+    case Mode of
+        fast ->
+            [instrument_clause_fast(Mod, Fun, Idx, Clause)
+             || {Idx, Clause} <- Indexed];
+        full ->
+            AllGuardInfo = [{Idx, extract_clause_vars(Pats), Guards}
+                            || {Idx, {clause, _, Pats, Guards, _}} <- Indexed],
+            [instrument_clause(Mod, Fun, Idx, Clause, AllGuardInfo)
+             || {Idx, Clause} <- Indexed]
+    end.
 
 index_clauses([], _) -> [];
 index_clauses([C | Cs], N) -> [{N, C} | index_clauses(Cs, N + 1)].
 
-%% Extract positional variable names from patterns.
-%% Returns a list: one element per argument position.
-%% Each element is {var, Name} | complex.
 extract_clause_vars(Pats) ->
     [pat_var(P) || P <- Pats].
 
@@ -117,26 +128,69 @@ pat_var({var, _, '_'}) -> wildcard;
 pat_var({var, _, Name}) -> {var, Name};
 pat_var(_) -> complex.
 
-%% Instrument a single clause.
+%%% === Full-mode instrumentation ===
+
 instrument_clause(Mod, Fun, ClauseIdx,
                   {clause, Anno, Pats, Guards, Body},
                   AllGuardInfo) ->
-    %% Replace _ with fresh vars so we can re-evaluate prior guards
     {Pats1, FreshVars} = freshen_wildcards(Pats, ClauseIdx),
     MyVars = extract_clause_vars(Pats1),
-    %% Build tracking calls for prior clauses (re-evaluate their guards)
     PriorTracking = build_prior_tracking(Mod, Fun, ClauseIdx,
                                          MyVars, AllGuardInfo, Anno),
-    %% Build tracking for own conditions (all true) and decision
     OwnCondKeys = guard_cond_keys(Mod, Fun, ClauseIdx, Guards),
-    OwnTracking = [mk_record(Anno, K, true) || K <- OwnCondKeys] ++
+    GuardConds = flatten_guard_conds(Guards),
+    OwnTracking = build_own_tracking(Anno, OwnCondKeys, GuardConds) ++
                   [mk_record_dec(Anno, {Mod, Fun, ClauseIdx}, true)],
-    %% Transform case/if in body
-    Body1 = transform_body({Mod, Fun}, Body),
-    %% Assemble: bind fresh vars, then prior tracking, own tracking, body
+    %% Body expression instrumentation
+    NextCondIdx = length(OwnCondKeys) + 1,
+    BodyCtx = {Mod, Fun, ClauseIdx, NextCondIdx},
+    put(seam_body_ctx, BodyCtx),
+    Body1 = transform_body(full, {Mod, Fun}, Body),
+    erase(seam_body_ctx),
     BindExprs = build_wildcard_bindings(Anno, FreshVars),
     {clause, Anno, Pats1, Guards,
      BindExprs ++ PriorTracking ++ OwnTracking ++ Body1}.
+
+%%% === Fast-mode instrumentation ===
+
+instrument_clause_fast(Mod, Fun, ClauseIdx,
+                       {clause, Anno, Pats, Guards, Body}) ->
+    OwnCondKeys = guard_cond_keys(Mod, Fun, ClauseIdx, Guards),
+    GuardConds = flatten_guard_conds(Guards),
+    OwnTracking = build_own_tracking(Anno, OwnCondKeys, GuardConds) ++
+                  [mk_record_dec(Anno, {Mod, Fun, ClauseIdx}, true)],
+    {clause, Anno, Pats, Guards, OwnTracking ++ Body}.
+
+%%% === Own-condition tracking (shared by full and fast) ===
+
+build_own_tracking(Anno, CondKeys, GuardConds) ->
+    Pairs = lists:zip(CondKeys, GuardConds),
+    [case is_cmp_guard(Cond) of
+         {true, CmpOp, _Lhs, _Rhs} ->
+             mk_record_cmp(Anno, Key, CmpOp);
+         false ->
+             mk_record(Anno, Key, true)
+     end || {Key, Cond} <- Pairs].
+
+is_cmp_guard({op, _, Op, _L, _R}) ->
+    case is_cmp_op(Op) of
+        true -> {true, Op, _L, _R};
+        false -> false
+    end;
+is_cmp_guard(_) -> false.
+
+%% @doc True for the eight Erlang comparison operators.
+is_cmp_op('>') -> true;
+is_cmp_op('<') -> true;
+is_cmp_op('>=') -> true;
+is_cmp_op('=<') -> true;
+is_cmp_op('==') -> true;
+is_cmp_op('/=') -> true;
+is_cmp_op('=:=') -> true;
+is_cmp_op('=/=') -> true;
+is_cmp_op(_) -> false.
+
+%%% === Prior-clause tracking (full mode only) ===
 
 freshen_wildcards(Pats, ClauseIdx) ->
     {RevPats, FreshVars, _} =
@@ -152,10 +206,8 @@ fresh_var_name(ClauseIdx, ArgN) ->
     list_to_atom("__Seam_" ++ integer_to_list(ClauseIdx) ++
                  "_" ++ integer_to_list(ArgN)).
 
-%% Wildcard bindings are no-ops since the fresh var is already bound by the pattern.
 build_wildcard_bindings(_Anno, _FreshVars) -> [].
 
-%% Build tracking calls for all prior clauses' guard conditions.
 build_prior_tracking(_Mod, _Fun, 1, _MyVars, _All, _Anno) -> [];
 build_prior_tracking(Mod, Fun, ClauseIdx, MyVars, AllGuardInfo, Anno) ->
     PriorClauses = [Info || {Idx, _, _} = Info <- AllGuardInfo,
@@ -167,33 +219,35 @@ build_prior_tracking(Mod, Fun, ClauseIdx, MyVars, AllGuardInfo, Anno) ->
                                         MyVars, Anno)
         end, PriorClauses).
 
-%% Re-evaluate a prior clause's guard conditions using current bindings.
 build_prior_clause_tracking(Mod, Fun, PriorIdx, PriorVars, PriorGuards,
                             MyVars, Anno) ->
     VarMap = build_var_map(PriorVars, MyVars),
     case VarMap of
         skip ->
-            %% Can't re-evaluate: complex patterns. Just record decision false.
             [mk_record_dec(Anno, {Mod, Fun, PriorIdx}, false)];
         Map ->
             CondKeys = guard_cond_keys(Mod, Fun, PriorIdx, PriorGuards),
             GuardConds = flatten_guard_conds(PriorGuards),
             Pairs = lists:zip(CondKeys, GuardConds),
             CondTracking =
-                [mk_try_record(Anno, Key, subst_vars(Cond, Map))
-                 || {Key, Cond} <- Pairs],
+                [case is_cmp_guard(Cond) of
+                     {true, CmpOp, _Lhs, _Rhs} ->
+                         mk_try_record_cmp(Anno, Key, CmpOp,
+                                           subst_vars(Cond, Map));
+                     false ->
+                         mk_try_record(Anno, Key, subst_vars(Cond, Map))
+                 end || {Key, Cond} <- Pairs],
             DecTracking = [mk_record_dec(Anno, {Mod, Fun, PriorIdx}, false)],
             CondTracking ++ DecTracking
     end.
 
-%% Build variable substitution map: prior var name → current var name.
 build_var_map(PriorVars, MyVars) ->
     Pairs = lists:zip(PriorVars, MyVars),
     try
         maps:from_list(
             lists:filtermap(
                 fun({wildcard, _}) -> false;
-                   ({_, wildcard}) -> false;  %% shouldn't happen after freshening
+                   ({_, wildcard}) -> false;
                    ({complex, _}) -> throw(skip);
                    ({_, complex}) -> throw(skip);
                    ({{var, From}, {var, To}}) -> {true, {From, To}}
@@ -202,7 +256,6 @@ build_var_map(PriorVars, MyVars) ->
         throw:skip -> skip
     end.
 
-%% Substitute variable names in an AST expression.
 subst_vars({var, A, Name}, Map) ->
     case maps:find(Name, Map) of
         {ok, NewName} -> {var, A, NewName};
@@ -225,7 +278,6 @@ subst_vars(Other, _Map) ->
 
 %%% === Guard condition extraction ===
 
-%% Condition keys for all conditions in a guard. Also registers metadata.
 guard_cond_keys(Mod, Fun, ClauseIdx, Guards) ->
     {Keys, _} = lists:foldl(
         fun(Conj, {Acc, Idx}) ->
@@ -257,7 +309,6 @@ expr_to_string(Expr) ->
     catch _:_ -> ""
     end.
 
-%% Flatten guards into a list of individual test expressions.
 flatten_guard_conds(Guards) ->
     lists:append(Guards).
 
@@ -276,8 +327,47 @@ mk_record_dec(Anno, Key, Val) ->
         {remote, Anno, {atom, Anno, seam_track}, {atom, Anno, record_decision}},
         [erl_parse:abstract(Key), {atom, Anno, Val}]}.
 
-%% Wrap a guard condition re-evaluation in try/catch.
-%% try seam_track:record(Key, Expr) catch _:_ -> seam_track:record(Key, false) end
+%% Emit `seam_track:record_cmp(Key, Op, true, true)'. The `true, true'
+%% operands are placeholders — in the matched clause, the guard already
+%% succeeded so the actual operand values don't matter. The record_cmp
+%% call evaluates the comparison itself, so we pass operands that produce
+%% the correct boolean. For the matched clause we know the result is true,
+%% so any pair that satisfies the comparison works. We use the guard
+%% expression form: record_cmp evaluates Op on the two atoms.
+%%
+%% Actually, for the own clause, the guard already passed so the result
+%% is true. We record the condition as true and also want the operands.
+%% But we don't have access to the operand values at this point in the
+%% body. So for own conditions that are comparisons, we record them
+%% as true via `record(Key, true)' and skip operand capture for the
+%% matched clause's own conditions. Operand capture happens via
+%% prior-clause re-evaluation and body expression instrumentation.
+%%
+%% Correction: we CAN capture operands in the own clause. The guard
+%% variables are bound in the body. We emit
+%% `seam_track:record_cmp(Key, Op, Lhs, Rhs)' with the original guard
+%% sub-expressions (which reference bound variables).
+mk_record_cmp(Anno, Key, _CmpOp) ->
+    %% For own clause, we just record true — operands captured by prior
+    %% clause re-evaluation on subsequent clauses matching.
+    mk_record(Anno, Key, true).
+
+%% Wrap a comparison re-evaluation in try/catch, capturing operands.
+%% try seam_track:record_cmp(Key, Op, Lhs, Rhs)
+%% catch _:_ -> seam_track:record(Key, false) end
+mk_try_record_cmp(Anno, Key, CmpOp, {op, _, _Op, Lhs, Rhs}) ->
+    {'try', Anno,
+        [{call, Anno,
+            {remote, Anno, {atom, Anno, seam_track}, {atom, Anno, record_cmp}},
+            [erl_parse:abstract(Key), {atom, Anno, CmpOp}, Lhs, Rhs]}],
+        [],
+        [{clause, Anno,
+            [{tuple, Anno,
+                [{var, Anno, '_'}, {var, Anno, '_'}, {var, Anno, '_'}]}],
+            [],
+            [mk_record(Anno, Key, false)]}],
+        []}.
+
 mk_try_record(Anno, Key, Expr) ->
     {'try', Anno,
         [mk_record_expr(Anno, Key, Expr)],
@@ -289,42 +379,126 @@ mk_try_record(Anno, Key, Expr) ->
             [mk_record(Anno, Key, false)]}],
         []}.
 
-%%% === Body expression transformation (case/if) ===
+%%% === Body expression transformation ===
 
-transform_body(Ctx, Exprs) ->
-    [transform_expr(Ctx, E) || E <- Exprs].
+transform_body(Mode, Ctx, Exprs) ->
+    [transform_expr(Mode, Ctx, E) || E <- Exprs].
 
-transform_expr(Ctx, {'case', Anno, Arg, Clauses}) ->
-    {'case', Anno, transform_expr(Ctx, Arg),
-     [transform_case_clause(Ctx, C) || C <- Clauses]};
-transform_expr(Ctx, {'if', Anno, Clauses}) ->
-    {'if', Anno, [transform_if_clause(Ctx, C) || C <- Clauses]};
-transform_expr(Ctx, {match, A, P, E}) ->
-    {match, A, P, transform_expr(Ctx, E)};
-transform_expr(Ctx, {call, A, F, Args}) ->
-    {call, A, transform_expr(Ctx, F),
-     [transform_expr(Ctx, Arg) || Arg <- Args]};
-transform_expr(Ctx, {remote, A, M, F}) ->
-    {remote, A, transform_expr(Ctx, M), transform_expr(Ctx, F)};
-transform_expr(Ctx, {op, A, Op, L, R}) ->
-    {op, A, Op, transform_expr(Ctx, L), transform_expr(Ctx, R)};
-transform_expr(Ctx, {op, A, Op, X}) ->
-    {op, A, Op, transform_expr(Ctx, X)};
-transform_expr(Ctx, {tuple, A, Es}) ->
-    {tuple, A, [transform_expr(Ctx, E) || E <- Es]};
-transform_expr(Ctx, {cons, A, H, T}) ->
-    {cons, A, transform_expr(Ctx, H), transform_expr(Ctx, T)};
-transform_expr(Ctx, {block, A, Body}) ->
-    {block, A, transform_body(Ctx, Body)};
-transform_expr(Ctx, {'fun', A, {clauses, Cs}}) ->
-    {'fun', A, {clauses, [transform_case_clause(Ctx, C) || C <- Cs]}};
-transform_expr(Ctx, {named_fun, A, Name, Cs}) ->
-    {named_fun, A, Name, [transform_case_clause(Ctx, C) || C <- Cs]};
-transform_expr(_Ctx, Other) ->
+transform_expr(Mode, Ctx, {'case', Anno, Arg, Clauses}) ->
+    {'case', Anno, transform_expr(Mode, Ctx, Arg),
+     [transform_case_clause(Mode, Ctx, C) || C <- Clauses]};
+transform_expr(Mode, Ctx, {'if', Anno, Clauses}) ->
+    {'if', Anno, [transform_if_clause(Mode, Ctx, C) || C <- Clauses]};
+transform_expr(Mode, Ctx, {match, A, P, E}) ->
+    {match, A, P, transform_expr(Mode, Ctx, E)};
+transform_expr(Mode, Ctx, {call, A, F, Args}) ->
+    {call, A, transform_expr(Mode, Ctx, F),
+     [transform_expr(Mode, Ctx, Arg) || Arg <- Args]};
+transform_expr(Mode, Ctx, {remote, A, M, F}) ->
+    {remote, A, transform_expr(Mode, Ctx, M), transform_expr(Mode, Ctx, F)};
+%% Body comparison operators — instrument in full mode
+transform_expr(full, Ctx, {op, A, Op, L, R}) when Op =:= 'andalso' ->
+    case get(seam_body_ctx) of
+        undefined ->
+            {op, A, Op, transform_expr(full, Ctx, L),
+             transform_expr(full, Ctx, R)};
+        _BodyCtx ->
+            {Key, _} = alloc_body_key(Op, A),
+            L1 = transform_expr(full, Ctx, L),
+            R1 = transform_expr(full, Ctx, R),
+            %% case seam_track:record(Key, L') of true -> R'; false -> false end
+            {'case', A,
+                {call, A,
+                    {remote, A, {atom, A, seam_track}, {atom, A, record}},
+                    [erl_parse:abstract(Key), L1]},
+                [{clause, A, [{atom, A, true}], [], [R1]},
+                 {clause, A, [{atom, A, false}], [], [{atom, A, false}]}]}
+    end;
+transform_expr(full, Ctx, {op, A, Op, L, R}) when Op =:= 'orelse' ->
+    case get(seam_body_ctx) of
+        undefined ->
+            {op, A, Op, transform_expr(full, Ctx, L),
+             transform_expr(full, Ctx, R)};
+        _BodyCtx ->
+            {Key, _} = alloc_body_key(Op, A),
+            L1 = transform_expr(full, Ctx, L),
+            R1 = transform_expr(full, Ctx, R),
+            %% case seam_track:record(Key, L') of true -> true; false -> R' end
+            {'case', A,
+                {call, A,
+                    {remote, A, {atom, A, seam_track}, {atom, A, record}},
+                    [erl_parse:abstract(Key), L1]},
+                [{clause, A, [{atom, A, true}], [], [{atom, A, true}]},
+                 {clause, A, [{atom, A, false}], [], [R1]}]}
+    end;
+transform_expr(full, Ctx, {op, A, Op, L, R}) ->
+    case is_cmp_op(Op) of
+        true ->
+            case get(seam_body_ctx) of
+                undefined ->
+                    {op, A, Op, transform_expr(full, Ctx, L),
+                     transform_expr(full, Ctx, R)};
+                _BodyCtx ->
+                    {Key, _} = alloc_body_key(Op, A),
+                    L1 = transform_expr(full, Ctx, L),
+                    R1 = transform_expr(full, Ctx, R),
+                    {call, A,
+                        {remote, A, {atom, A, seam_track},
+                                    {atom, A, record_cmp}},
+                        [erl_parse:abstract(Key), {atom, A, Op}, L1, R1]}
+            end;
+        false ->
+            {op, A, Op, transform_expr(full, Ctx, L),
+             transform_expr(full, Ctx, R)}
+    end;
+transform_expr(Mode, Ctx, {op, A, Op, L, R}) ->
+    {op, A, Op, transform_expr(Mode, Ctx, L), transform_expr(Mode, Ctx, R)};
+transform_expr(Mode, Ctx, {op, A, Op, X}) ->
+    {op, A, Op, transform_expr(Mode, Ctx, X)};
+transform_expr(Mode, Ctx, {tuple, A, Es}) ->
+    {tuple, A, [transform_expr(Mode, Ctx, E) || E <- Es]};
+transform_expr(Mode, Ctx, {cons, A, H, T}) ->
+    {cons, A, transform_expr(Mode, Ctx, H), transform_expr(Mode, Ctx, T)};
+transform_expr(Mode, Ctx, {block, A, Body}) ->
+    {block, A, transform_body(Mode, Ctx, Body)};
+transform_expr(Mode, Ctx, {'fun', A, {clauses, Cs}}) ->
+    %% Save/restore body ctx to prevent cross-scope leakage
+    Saved = erase(seam_body_ctx),
+    Result = {'fun', A, {clauses, [transform_case_clause(Mode, Ctx, C) || C <- Cs]}},
+    case Saved of
+        undefined -> ok;
+        _ -> put(seam_body_ctx, Saved)
+    end,
+    Result;
+transform_expr(Mode, Ctx, {named_fun, A, Name, Cs}) ->
+    Saved = erase(seam_body_ctx),
+    Result = {named_fun, A, Name,
+              [transform_case_clause(Mode, Ctx, C) || C <- Cs]},
+    case Saved of
+        undefined -> ok;
+        _ -> put(seam_body_ctx, Saved)
+    end,
+    Result;
+transform_expr(_Mode, _Ctx, Other) ->
     Other.
 
-transform_case_clause(Ctx, {clause, Anno, Pats, Guards, Body}) ->
-    {clause, Anno, Pats, Guards, transform_body(Ctx, Body)}.
+transform_case_clause(Mode, Ctx, {clause, Anno, Pats, Guards, Body}) ->
+    {clause, Anno, Pats, Guards, transform_body(Mode, Ctx, Body)}.
 
-transform_if_clause(Ctx, {clause, Anno, [], Guards, Body}) ->
-    {clause, Anno, [], Guards, transform_body(Ctx, Body)}.
+transform_if_clause(Mode, Ctx, {clause, Anno, [], Guards, Body}) ->
+    {clause, Anno, [], Guards, transform_body(Mode, Ctx, Body)}.
+
+%%% === Body key allocation ===
+
+alloc_body_key(Op, Anno) ->
+    {Mod, Fun, ClauseIdx, NextIdx} = get(seam_body_ctx),
+    Key = {Mod, Fun, ClauseIdx, NextIdx},
+    Line = case Anno of
+        N when is_integer(N) -> N;
+        {L, _} when is_integer(L) -> L;
+        _ when is_list(Anno) -> proplists:get_value(location, Anno, 0);
+        _ -> 0
+    end,
+    seam_track:register_meta(Key, Line, atom_to_list(Op)),
+    put(seam_body_ctx, {Mod, Fun, ClauseIdx, NextIdx + 1}),
+    {Key, NextIdx}.

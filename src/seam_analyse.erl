@@ -1,13 +1,16 @@
 %% @doc Coverage metrics computed from `seam_track' data.
 %%
-%% Condition summary, decision summary, untested condition detection, and
-%% MC/DC independence pair computation. All functions are pure queries over
-%% the ETS tables — no side effects.
+%% Condition summary, decision summary, untested condition detection,
+%% boundary condition analysis, edge summary, and MC/DC independence
+%% pair computation. All functions are pure queries over the ETS
+%% tables — no side effects.
 -module(seam_analyse).
 -include("seam.hrl").
 
 -export([condition_summary/1, decision_summary/1]).
 -export([untested_conditions/1]).
+-export([boundary_conditions/1]).
+-export([edge_summary/1]).
 -export([mcdc_coverage/1]).
 
 %% @doc Count of conditions evaluated both true and false vs total conditions.
@@ -50,9 +53,41 @@ untested_conditions(Mod) ->
         end
     end, [], Cov).
 
+%% @doc Stuck conditions annotated with the most recent operand miss.
+%% Cross-references `untested_conditions/1' with `seam_track:operands/1'
+%% to report what values nearly flipped a stuck condition.
+-spec boundary_conditions(module()) ->
+    [{cond_key(), never_true | never_false, {atom(), term(), term()}}].
+boundary_conditions(Mod) ->
+    Untested = untested_conditions(Mod),
+    Ops = seam_track:operands(Mod),
+    lists:filtermap(fun({Key, Status}) ->
+        case maps:find(Key, Ops) of
+            {ok, ByBool} ->
+                %% For never_true, look for a false operand (closest miss)
+                %% For never_false, look for a true operand
+                MissBool = case Status of
+                    never_true  -> false;
+                    never_false -> true
+                end,
+                case maps:find(MissBool, ByBool) of
+                    {ok, OpTriple} -> {true, {Key, Status, OpTriple}};
+                    error -> false
+                end;
+            error -> false
+        end
+    end, Untested).
+
+%% @doc Edge summary: `{UniqueEdges, TotalTransitions}'.
+-spec edge_summary(module()) -> {non_neg_integer(), non_neg_integer()}.
+edge_summary(Mod) ->
+    Edges = seam_track:edges(Mod),
+    Unique = maps:size(Edges),
+    Total = maps:fold(fun(_, Cnt, Acc) -> Acc + Cnt end, 0, Edges),
+    {Unique, Total}.
+
 %% @doc Compute MC/DC independence pairs from collected test vectors.
 %% Return `{error, not_collected}' if no vectors exist for `Mod'.
-%% Each condition maps to `satisfied' or `unsatisfied'.
 -spec mcdc_coverage(module()) -> {ok, map()} | {error, not_collected}.
 mcdc_coverage(Mod) ->
     case ets:whereis(?SEAM_VECTORS) of
@@ -65,8 +100,6 @@ mcdc_coverage(Mod) ->
             end
     end.
 
-%% For each condition index, find an independence pair:
-%% two vectors that differ only in that condition and have different outcomes.
 compute_mcdc(Vectors) ->
     ByDecision = group_by_decision(Vectors),
     maps:fold(fun(_DecKey, Vecs, Acc) ->

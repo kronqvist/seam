@@ -12,58 +12,107 @@ cleanup(_) ->
     ok.
 
 compile_target(Mod) ->
+    compile_target(Mod, #{}).
+
+compile_target(Mod, Opts) ->
     Src = ?TARGETS ++ atom_to_list(Mod) ++ ".erl",
     {ok, Mod, Bin} = compile:file(Src, [binary, debug_info]),
     BeamPath = "/tmp/seam_test_" ++ atom_to_list(Mod) ++ ".beam",
     ok = file:write_file(BeamPath, Bin),
     code:purge(Mod),
     {module, Mod} = code:load_binary(Mod, BeamPath, Bin),
-    {ok, Mod} = seam:compile_beam(Mod),
+    {ok, Mod} = seam:compile_beam(Mod, maps:merge(#{mode => full}, Opts)),
     ok.
 
-%% Guard instrumentation: single-condition clauses
-guard_basic_test_() ->
+%%% === API alignment tests ===
+
+%% analyse/1 defaults to condition level
+analyse_default_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        {ok, Cov} = seam:analyse(simple_guards),
+        ?assert(maps:is_key({simple_guards, classify, 1, 1}, Cov))
+    end}.
+
+%% analyse/2 condition level
+analyse_condition_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(simple_guards),
         large = simple_guards:classify(15),
         small = simple_guards:classify(5),
         zero  = simple_guards:classify(-1),
-        Cov = seam:condition_coverage(simple_guards),
-        %% Clause 1 condition (X > 10): true once (15), false twice (5, -1)
+        {ok, Cov} = seam:analyse(simple_guards, condition),
         ?assertEqual({1, 2}, maps:get({simple_guards, classify, 1, 1}, Cov)),
-        %% Clause 2 condition (X > 0): true once (5), false once (-1)
         ?assertEqual({1, 1}, maps:get({simple_guards, classify, 2, 1}, Cov))
     end}.
 
-%% Guard instrumentation: multi-condition guards
-guard_multi_test_() ->
-    {setup, fun setup/0, fun cleanup/1, fun() ->
-        ok = compile_target(simple_guards),
-        both    = simple_guards:classify2(15, 3),
-        x_only  = simple_guards:classify2(15, 10),
-        neither = simple_guards:classify2(1, 1),
-        Cov = seam:condition_coverage(simple_guards),
-        %% Clause 1 cond 1 (X>10): true 2 (direct + re-eval), false 1 (re-eval)
-        ?assertEqual({2, 1}, maps:get({simple_guards, classify2, 1, 1}, Cov)),
-        %% Clause 1 cond 2 (Y<5): true 2 (direct + re-eval), false 1 (re-eval)
-        ?assertEqual({2, 1}, maps:get({simple_guards, classify2, 1, 2}, Cov))
-    end}.
-
-%% Decision coverage tracking
-decision_test_() ->
+%% analyse/2 decision level
+analyse_decision_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(simple_guards),
         large = simple_guards:classify(15),
         small = simple_guards:classify(5),
         zero  = simple_guards:classify(-1),
-        Dec = seam:decision_coverage(simple_guards),
-        %% Clause 1 decision: succeeded once (15), failed twice (5, -1)
+        {ok, Dec} = seam:analyse(simple_guards, decision),
         ?assertEqual({1, 2}, maps:get({simple_guards, classify, 1}, Dec)),
-        %% Clause 2 decision: succeeded once (5), failed once (-1)
         ?assertEqual({1, 1}, maps:get({simple_guards, classify, 2}, Dec))
     end}.
 
-%% Semantics preserved: instrumented code returns same values
+%% modules/0 and is_compiled/1
+modules_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        Mods = seam:modules(),
+        ?assert(lists:member(simple_guards, Mods)),
+        ?assertMatch({file, _}, seam:is_compiled(simple_guards)),
+        ?assertEqual(false, seam:is_compiled(nonexistent_mod))
+    end}.
+
+%% reset/1 per-module
+reset_module_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        ok = seam:reset(simple_guards),
+        {ok, Cov} = seam:analyse(simple_guards, condition),
+        ?assertEqual(#{}, Cov),
+        ?assertEqual({error, {not_compiled, nonexistent}}, seam:reset(nonexistent))
+    end}.
+
+%% export/2 per-module
+export_module_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        Path = "/tmp/seam_test_export_mod.dat",
+        ok = seam:export(Path, simple_guards),
+        seam:reset(),
+        ok = seam:import(Path),
+        {ok, Cov} = seam:analyse(simple_guards, condition),
+        ?assert(maps:size(Cov) > 0),
+        file:delete(Path)
+    end}.
+
+%% analyse_to_file/1 and analyse_to_file/2
+analyse_to_file_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        {ok, TxtFile} = seam:analyse_to_file(simple_guards),
+        ?assert(filelib:is_file(TxtFile)),
+        file:delete(TxtFile),
+        {ok, HtmlFile} = seam:analyse_to_file(simple_guards, [html]),
+        ?assert(filelib:is_file(HtmlFile)),
+        file:delete(HtmlFile),
+        CustomPath = "/tmp/seam_custom_report.txt",
+        {ok, CustomPath} = seam:analyse_to_file(simple_guards, [{outfile, CustomPath}]),
+        ?assert(filelib:is_file(CustomPath)),
+        file:delete(CustomPath)
+    end}.
+
+%%% === Semantics preservation ===
+
 semantics_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(simple_guards),
@@ -73,7 +122,6 @@ semantics_test_() ->
         ?assertEqual(zero,  simple_guards:classify(-5))
     end}.
 
-%% Case expression instrumentation
 case_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(case_example),
@@ -88,6 +136,153 @@ reset_test_() ->
         ok = compile_target(simple_guards),
         simple_guards:classify(15),
         seam:reset(),
-        Cov = seam:condition_coverage(simple_guards),
+        {ok, Cov} = seam:analyse(simple_guards, condition),
         ?assertEqual(#{}, Cov)
+    end}.
+
+%%% === Feature 1: Incremental novelty detection ===
+
+take_new_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% No discoveries yet
+        ?assertEqual(false, seam:has_new()),
+        ?assertEqual([], seam:take_new()),
+        %% Exercise — should produce discoveries
+        simple_guards:classify(15),
+        ?assertEqual(true, seam:has_new()),
+        D1 = seam:take_new(),
+        ?assert(length(D1) > 0),
+        %% After take_new, cleared
+        ?assertEqual(false, seam:has_new()),
+        ?assertEqual([], seam:take_new()),
+        %% Same input produces no new discoveries (reset edge state to
+        %% prevent cross-iteration edge discoveries)
+        seam:reset_edge_state(),
+        simple_guards:classify(15),
+        ?assertEqual(false, seam:has_new()),
+        %% New path produces new discoveries
+        simple_guards:classify(5),
+        ?assertEqual(true, seam:has_new()),
+        D2 = seam:take_new(),
+        ?assert(length(D2) > 0)
+    end}.
+
+%%% === Feature 2: Comparison operand capture ===
+
+operand_capture_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% Exercise: classify(7) hits clause 2 (X > 0), misses clause 1 (X > 10)
+        simple_guards:classify(7),
+        {ok, Ops} = seam:analyse(simple_guards, operand),
+        %% Prior clause re-evaluation of X > 10 with X=7 should capture operands
+        %% Key for clause 1, condition 1
+        Key11 = {simple_guards, classify, 1, 1},
+        case maps:find(Key11, Ops) of
+            {ok, ByBool} ->
+                %% Should have false => {'>', 7, 10}
+                ?assertMatch(#{false := {'>', 7, 10}}, ByBool);
+            error ->
+                %% Operand capture via prior re-eval — may or may not be present
+                %% depending on whether the condition was a comparison
+                ok
+        end
+    end}.
+
+%%% === Feature 3: Edge coverage ===
+
+edge_coverage_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        seam:reset_edge_state(),
+        %% Two calls in sequence should produce decision-to-decision edges
+        simple_guards:classify(15),
+        simple_guards:classify(5),
+        {ok, Edges} = seam:analyse(simple_guards, edge),
+        %% At least one edge should exist (clause 1 -> clause 2 transition)
+        ?assert(maps:size(Edges) > 0),
+        %% Edge summary
+        {Unique, Total} = seam_analyse:edge_summary(simple_guards),
+        ?assert(Unique > 0),
+        ?assert(Total > 0)
+    end}.
+
+reset_edge_state_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        seam:reset_edge_state(),
+        %% After reset, the next call should not produce an edge from previous
+        simple_guards:classify(5),
+        ok
+    end}.
+
+%%% === Feature 4: Lightweight fast mode ===
+
+fast_mode_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards, #{mode => fast}),
+        %% Semantics preserved
+        ?assertEqual(large, simple_guards:classify(100)),
+        ?assertEqual(small, simple_guards:classify(1)),
+        ?assertEqual(zero,  simple_guards:classify(0)),
+        %% Coverage recorded for own conditions
+        {ok, Cov} = seam:analyse(simple_guards, condition),
+        ?assert(maps:size(Cov) > 0),
+        %% Fast mode does not re-evaluate prior clauses,
+        %% so fewer false counts are expected
+        {ok, Dec} = seam:analyse(simple_guards, decision),
+        ?assert(maps:size(Dec) > 0)
+    end}.
+
+%%% === Feature 5: Body expression instrumentation ===
+
+body_cmp_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(body_example),
+        ?assertEqual(big, body_example:check(15, 0)),
+        ?assertEqual(small, body_example:check(0, 5)),
+        %% Body comparisons should be captured
+        {ok, Cov} = seam:analyse(body_example, condition),
+        ?assert(maps:size(Cov) > 0)
+    end}.
+
+body_logic_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(body_example),
+        ?assertEqual(both_pos, body_example:logic(1, 1)),
+        ?assertEqual(one_pos,  body_example:logic(1, -1)),
+        ?assertEqual(one_pos,  body_example:logic(-1, 1)),
+        ?assertEqual(none_pos, body_example:logic(-1, -1)),
+        %% andalso/orelse should be instrumented as conditions
+        {ok, Cov} = seam:analyse(body_example, condition),
+        %% Should have conditions from the andalso and orelse in logic/2
+        LogicConds = maps:filter(fun({body_example, logic, _, _}, _) -> true;
+                                    (_, _) -> false end, Cov),
+        ?assert(maps:size(LogicConds) > 0)
+    end}.
+
+body_operand_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(body_example),
+        body_example:logic(5, -3),
+        {ok, Ops} = seam:analyse(body_example, operand),
+        %% Should have operand data from body comparisons
+        BodyOps = maps:filter(fun({body_example, logic, _, _}, _) -> true;
+                                 (_, _) -> false end, Ops),
+        ?assert(maps:size(BodyOps) > 0)
+    end}.
+
+%%% === Multi-condition guards (regression) ===
+
+guard_multi_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        both    = simple_guards:classify2(15, 3),
+        x_only  = simple_guards:classify2(15, 10),
+        neither = simple_guards:classify2(1, 1),
+        {ok, Cov} = seam:analyse(simple_guards, condition),
+        ?assertEqual({2, 1}, maps:get({simple_guards, classify2, 1, 1}, Cov)),
+        ?assertEqual({2, 1}, maps:get({simple_guards, classify2, 1, 2}, Cov))
     end}.

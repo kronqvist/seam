@@ -3,7 +3,8 @@
 %% Plain-text summaries and source-annotated HTML reports. The HTML report
 %% follows `cover:analyse_to_file/2' conventions: a three-column table
 %% (line number, annotations, source) with colour-coded rows. Guard lines
-%% carry per-condition badges showing true/false counts.
+%% carry per-condition badges showing true/false counts. Text reports
+%% include operand data for stuck conditions and edge coverage summary.
 -module(seam_report).
 -include("seam.hrl").
 
@@ -15,6 +16,8 @@ text(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
     {DecCov, DecTotal} = seam_analyse:decision_summary(Mod),
     Untested = seam_analyse:untested_conditions(Mod),
+    Boundary = seam_analyse:boundary_conditions(Mod),
+    {UniqueEdges, TotalTrans} = seam_analyse:edge_summary(Mod),
     CondPct = pct(CondCov, CondTotal),
     DecPct = pct(DecCov, DecTotal),
     [io_lib:format("Module: ~s~n", [Mod]),
@@ -22,7 +25,10 @@ text(Mod) ->
                    [CondPct, CondCov, CondTotal]),
      io_lib:format("Decision Coverage:  ~.1f% (~p/~p decisions tried both outcomes)~n",
                    [DecPct, DecCov, DecTotal]),
-     format_untested(Untested)].
+     io_lib:format("Edge Coverage:      ~p unique edges, ~p total transitions~n",
+                   [UniqueEdges, TotalTrans]),
+     format_untested(Untested),
+     format_boundary(Boundary)].
 
 format_untested([]) -> [];
 format_untested(Items) ->
@@ -36,6 +42,19 @@ format_untested_item({{Mod, Fun, Clause, Cond}, Status}) ->
     end,
     io_lib:format("  ~s:~s/clause ~p, condition ~p -- ~s~n",
                   [Mod, Fun, Clause, Cond, StatusStr]).
+
+format_boundary([]) -> [];
+format_boundary(Items) ->
+    ["\nBoundary conditions (closest miss operands):\n" |
+     [format_boundary_item(I) || I <- Items]].
+
+format_boundary_item({{Mod, Fun, Clause, Cond}, Status, {Op, Lhs, Rhs}}) ->
+    StatusStr = case Status of
+        never_true  -> "never true";
+        never_false -> "never false"
+    end,
+    io_lib:format("  ~s:~s/clause ~p, condition ~p -- ~s  (last: ~p ~s ~p)~n",
+                  [Mod, Fun, Clause, Cond, StatusStr, Lhs, Op, Rhs]).
 
 %% @doc Source-annotated HTML report with per-condition badges and colour-coded lines.
 -spec html(module()) -> iolist().
@@ -73,7 +92,6 @@ read_source(Mod) ->
 find_source(Mod) ->
     case code:which(Mod) of
         Path when is_list(Path) ->
-            %% Try to find source from beam info
             case beam_lib:chunks(Path, [compile_info]) of
                 {ok, {Mod, [{compile_info, Info}]}} ->
                     case proplists:get_value(source, Info) of
@@ -101,7 +119,6 @@ guess_source(Mod) ->
 
 %%% Metadata grouping
 
-%% Build #{Line => [{CondKey, ExprStr, TrueCnt, FalseCnt}]}.
 group_meta_by_line(Meta, Cov) ->
     lists:foldl(fun({Key, Line, ExprStr}, Acc) ->
         {T, F} = maps:get(Key, Cov, {0, 0}),
@@ -176,7 +193,6 @@ source_rows([Line | Rest], ByLine, N) ->
     [Row | source_rows(Rest, ByLine, N + 1)].
 
 source_row(N, Src, []) ->
-    %% Non-instrumented line
     io_lib:format("<tr>"
                   "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
                   "<td class=\"annot\"></td>"

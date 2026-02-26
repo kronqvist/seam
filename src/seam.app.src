@@ -2,7 +2,7 @@
     {description, "Condition-level coverage analysis for Erlang"},
     {vsn, "0.1.0"},
     {registered, []},
-    {applications, [kernel, stdlib]},
+    {applications, [kernel, stdlib, compiler]},
     {modules, []},
     {env, []}
 ]}.
