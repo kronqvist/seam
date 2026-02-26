@@ -32,9 +32,9 @@ compile_beam(ModOrPath) ->
 -spec compile_beam(module() | string(), map()) -> {ok, module()} | {error, term()}.
 compile_beam(ModOrPath, Opts) ->
     case resolve_beam(ModOrPath) of
-        {ok, Mod, Beam} ->
+        {ok, Mod, Beam, Path} ->
             case extract_forms(Mod, Beam) of
-                {ok, Forms} -> do_instrument(Mod, Beam, Forms, Opts);
+                {ok, Forms} -> do_instrument(Mod, Beam, Path, Forms, Opts);
                 Err -> Err
             end;
         Err -> Err
@@ -48,7 +48,7 @@ resolve_beam(Mod) when is_atom(Mod) ->
         cover_compiled -> {error, {cover_compiled, Mod}};
         Path ->
             case file:read_file(Path) of
-                {ok, Bin} -> {ok, Mod, Bin};
+                {ok, Bin} -> {ok, Mod, Bin, Path};
                 {error, R} -> {error, {read_failed, Path, R}}
             end
     end;
@@ -56,7 +56,7 @@ resolve_beam(Path) when is_list(Path); is_binary(Path) ->
     case file:read_file(Path) of
         {ok, Bin} ->
             case beam_lib:info(Bin) of
-                [{module, Mod} | _] -> {ok, Mod, Bin};
+                [{module, Mod} | _] -> {ok, Mod, Bin, Path};
                 _ -> {error, {bad_beam, Path}}
             end;
         {error, R} -> {error, {read_failed, Path, R}}
@@ -74,19 +74,19 @@ extract_forms(Mod, Beam) ->
 
 %%% === Compile and load ===
 
-do_instrument(Mod, OrigBeam, Forms, Opts) ->
+do_instrument(Mod, OrigBeam, OrigPath, Forms, Opts) ->
     Instrumented = transform_forms(Mod, Forms, Opts),
     case compile:forms(Instrumented, [binary, return_errors, debug_info]) of
         {ok, Mod, Binary} ->
-            load_instrumented(Mod, OrigBeam, Binary);
+            load_instrumented(Mod, OrigBeam, OrigPath, Binary);
         {ok, Mod, Binary, _Warn} ->
-            load_instrumented(Mod, OrigBeam, Binary);
+            load_instrumented(Mod, OrigBeam, OrigPath, Binary);
         {error, Errors, _Warn} ->
             {error, {compile_failed, Errors}}
     end.
 
-load_instrumented(Mod, OrigBeam, Binary) ->
-    seam_track:register_module(Mod, OrigBeam),
+load_instrumented(Mod, OrigBeam, OrigPath, Binary) ->
+    seam_track:register_module(Mod, OrigBeam, OrigPath),
     code:purge(Mod),
     case code:load_binary(Mod, "seam_instrumented", Binary) of
         {module, Mod} -> {ok, Mod};

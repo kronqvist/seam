@@ -68,7 +68,7 @@ modules() ->
 -spec is_compiled(module()) -> {file, string()} | false.
 is_compiled(Mod) ->
     case ets:lookup(?SEAM_MODULES, Mod) of
-        [{Mod, _Beam}] -> {file, "seam_instrumented"};
+        [{Mod, _Beam, OrigPath}] -> {file, OrigPath};
         [] -> false
     end.
 
@@ -169,9 +169,9 @@ bump_n(Tab, Key, Bool, N) ->
 
 restore_module(Mod) ->
     case ets:lookup(?SEAM_MODULES, Mod) of
-        [{Mod, OrigBeam}] ->
+        [{Mod, OrigBeam, OrigPath}] ->
             code:purge(Mod),
-            code:load_binary(Mod, "restored", OrigBeam),
+            code:load_binary(Mod, OrigPath, OrigBeam),
             seam_track:unregister_module(Mod);
         [] -> ok
     end.

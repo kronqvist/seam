@@ -15,7 +15,7 @@
 -export([operands/1]).
 -export([edges/0, edges/1, reset_edge_state/0]).
 -export([conditions/0, conditions/1, decisions/0, decisions/1]).
--export([modules/0, register_module/2, unregister_module/1]).
+-export([modules/0, register_module/3, unregister_module/1]).
 -export([register_meta/3, meta/1]).
 
 %% @doc Create all ETS tables. Call once at startup.
@@ -179,10 +179,12 @@ decisions() ->
 decisions(Mod) ->
     maps:filter(fun({M, _, _}, _) -> M =:= Mod end, decisions()).
 
-%% @doc Stash the original BEAM binary for later restoration.
--spec register_module(module(), binary()) -> ok.
-register_module(Mod, OrigBeam) ->
-    ets:insert(?SEAM_MODULES, {Mod, OrigBeam}),
+%% @doc Stash the original BEAM binary and its filesystem path for
+%% later restoration. The path is passed to `code:load_binary/3' when
+%% the module is restored, so `code:which/1' returns a valid filename.
+-spec register_module(module(), binary(), string()) -> ok.
+register_module(Mod, OrigBeam, OrigPath) ->
+    ets:insert(?SEAM_MODULES, {Mod, OrigBeam, OrigPath}),
     ok.
 
 %% @doc Remove a module from the tracked set.
@@ -194,7 +196,7 @@ unregister_module(Mod) ->
 %% @doc List all currently instrumented modules.
 -spec modules() -> [module()].
 modules() ->
-    [M || {M, _} <- ets:tab2list(?SEAM_MODULES)].
+    [M || {M, _, _} <- ets:tab2list(?SEAM_MODULES)].
 
 %% @doc Store condition metadata (source line and expression text).
 -spec register_meta(cond_key(), pos_integer(), string()) -> ok.
