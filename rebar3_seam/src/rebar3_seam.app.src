@@ -1,0 +1,8 @@
+{application, rebar3_seam, [
+    {description, "rebar3 plugin for seam condition coverage"},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {applications, [kernel, stdlib]},
+    {modules, []},
+    {env, []}
+]}.
