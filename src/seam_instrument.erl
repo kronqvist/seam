@@ -468,20 +468,18 @@ transform_expr(Mode, Ctx, {cons, A, H, T}) ->
 transform_expr(Mode, Ctx, {block, A, Body}) ->
     {block, A, transform_body(Mode, Ctx, Body)};
 transform_expr(Mode, Ctx, {'fun', A, {clauses, Cs}}) ->
-    %% Save/restore body ctx and dec idx to prevent cross-scope leakage
+    %% Isolate body ctx (clause-specific condition indices) but keep
+    %% dec idx running — fun clauses and their case/if branches share
+    %% the enclosing function's monotonic decision counter.
     SavedCtx = erase(seam_body_ctx),
-    SavedIdx = erase(seam_dec_idx),
     Result = {'fun', A, {clauses, [transform_case_clause(Mode, Ctx, C) || C <- Cs]}},
     restore_pd(seam_body_ctx, SavedCtx),
-    restore_pd(seam_dec_idx, SavedIdx),
     Result;
 transform_expr(Mode, Ctx, {named_fun, A, Name, Cs}) ->
     SavedCtx = erase(seam_body_ctx),
-    SavedIdx = erase(seam_dec_idx),
     Result = {named_fun, A, Name,
               [transform_case_clause(Mode, Ctx, C) || C <- Cs]},
     restore_pd(seam_body_ctx, SavedCtx),
-    restore_pd(seam_dec_idx, SavedIdx),
     Result;
 transform_expr(_Mode, _Ctx, Other) ->
     Other.

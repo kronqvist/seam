@@ -41,19 +41,21 @@ decision_summary(Mod) ->
     end, 0, Dec),
     {Covered, Total}.
 
-%% @doc Count of decisions entered at least once vs total decisions.
-%% Reachability metric: measures clause/branch entry, not both-sides coverage.
+%% @doc Count of decisions entered at least once vs total registered decisions.
+%% Total comes from `decision_meta' (all instrumented clauses/branches),
+%% not from the decisions table (which omits never-exercised entries).
 -spec clause_summary(module()) -> {Reached :: non_neg_integer(),
                                     Total :: non_neg_integer()}.
 clause_summary(Mod) ->
+    DecMeta = seam_track:decision_meta(Mod),
+    Total = length(DecMeta),
     Dec = seam_track:decisions(Mod),
-    Total = maps:size(Dec),
-    Reached = maps:fold(fun(_, {T, _}, Acc) ->
-        case T > 0 of
-            true -> Acc + 1;
-            false -> Acc
+    Reached = lists:foldl(fun({Key, _, _}, Acc) ->
+        case maps:find(Key, Dec) of
+            {ok, {T, _}} when T > 0 -> Acc + 1;
+            _ -> Acc
         end
-    end, 0, Dec),
+    end, 0, DecMeta),
     {Reached, Total}.
 
 %% @doc Conditions stuck on one side: never true or never false.
