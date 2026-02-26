@@ -356,52 +356,256 @@ if_branch_test_() ->
         ?assertEqual(3, length(IfMeta))
     end}.
 
-%%% === Clause summary ===
+%%% === Clause summary with concrete values ===
 
 clause_summary_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(simple_guards),
+        %% classify(15) enters clause 1, classify(5) enters clause 2
         simple_guards:classify(15),
         simple_guards:classify(5),
-        %% 2 of 3 classify clauses entered (not the zero clause),
-        %% plus all 3 classify2 clauses show up as decisions
-        %% but classify2 not called yet so only classify decisions active
-        {Reached, Total} = seam_analyse:clause_summary(simple_guards),
-        ?assert(Reached > 0),
-        ?assert(Total > 0),
-        ?assert(Reached =< Total)
+        %% 2 of 6 total clauses entered (classify2 not called)
+        ?assertEqual({2, 6}, seam_analyse:clause_summary(simple_guards)),
+        %% Exercise all remaining clauses
+        simple_guards:classify(0),
+        simple_guards:classify2(15, 3),
+        simple_guards:classify2(15, 10),
+        simple_guards:classify2(1, 1),
+        ?assertEqual({6, 6}, seam_analyse:clause_summary(simple_guards))
     end}.
 
-%%% === HTML report colouring ===
+%%% === Untested + boundary conditions ===
 
-html_clause_colouring_test_() ->
+untested_conditions_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(simple_guards),
+        %% classify(15) enters clause 1: X > 10 is true but never false
         simple_guards:classify(15),
-        Html = lists:flatten(seam_report:html(simple_guards)),
-        %% The clause line for classify(X) when X > 10 should be coloured
-        %% (it has both condition AND decision data — condition wins)
-        ?assert(string:find(Html, "class=\"hit\"") =/= nomatch
-            orelse string:find(Html, "class=\"partial\"") =/= nomatch),
-        %% The Clause row should appear in the summary table
-        ?assert(string:find(Html, "Clause") =/= nomatch)
+        Untested = seam_analyse:untested_conditions(simple_guards),
+        Stuck = [{K, S} || {K, S} <- Untested,
+                 element(1, K) =:= simple_guards,
+                 element(2, K) =:= classify],
+        ?assert(lists:member({{simple_guards, classify, 1, 1}, never_false}, Stuck))
     end}.
 
-html_decision_only_colouring_test_() ->
+boundary_conditions_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% classify(7) hits clause 2 (X > 0), re-evaluates clause 1 (X > 10)
+        %% with X=7 as false. Captures operand {>, 7, 10}.
+        simple_guards:classify(7),
+        Boundary = seam_analyse:boundary_conditions(simple_guards),
+        Key11 = {simple_guards, classify, 1, 1},
+        ?assert(lists:any(fun({K, never_true, {'>', 7, 10}}) -> K =:= Key11;
+                             (_) -> false end, Boundary))
+    end}.
+
+%%% === Fast mode suppresses case/if branch instrumentation ===
+
+fast_mode_no_branches_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(case_example, #{mode => fast}),
+        ?assertEqual(medium, case_example:foo(50)),
+        ?assertEqual(large,  case_example:foo(200)),
+        ?assertEqual(small,  case_example:foo(5)),
+        %% Fast mode: only clause decision meta, no case branch meta
+        Meta = seam_track:decision_meta(case_example),
+        ClauseMeta = [M || {_, _, "clause"} = M <- Meta],
+        CaseMeta   = [M || {_, _, "case branch"} = M <- Meta],
+        ?assertEqual(1, length(ClauseMeta)),
+        ?assertEqual(0, length(CaseMeta))
+    end}.
+
+%%% === Fun/named_fun scope with case/if branch tracking ===
+
+fun_case_branch_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(fun_case_example),
+        ?assertEqual(1, fun_case_example:with_fun(a)),
+        ?assertEqual(2, fun_case_example:with_fun(b)),
+        ?assertEqual(0, fun_case_example:with_fun(c)),
+        %% Case branches inside anonymous fun should be tracked
+        Meta = seam_track:decision_meta(fun_case_example),
+        CaseMeta = [M || {_, _, "case branch"} = M <- Meta],
+        ?assert(length(CaseMeta) >= 3),
+        %% All three branches entered
+        {ok, Dec} = seam:analyse(fun_case_example, decision),
+        FunDecs = maps:filter(fun({fun_case_example, with_fun, _}, _) -> true;
+                                 (_, _) -> false end, Dec),
+        AllEntered = maps:fold(fun(_, {T, _}, Acc) -> Acc andalso T > 0 end,
+                               true, FunDecs),
+        ?assert(AllEntered)
+    end}.
+
+named_fun_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(fun_case_example),
+        ?assertEqual(done, fun_case_example:with_named_fun(3)),
+        ?assertEqual(done, fun_case_example:with_named_fun(0)),
+        %% Named fun clauses should produce case branch decisions
+        Meta = seam_track:decision_meta(fun_case_example),
+        %% with_fun: 1 clause + 3 case branches + 1 fun clause
+        %% with_named_fun: 1 clause + 2 named_fun clauses
+        %% Total case branch entries from the fun's case: 3
+        CaseMeta = [M || {_, _, "case branch"} = M <- Meta],
+        ?assert(length(CaseMeta) >= 3)
+    end}.
+
+%%% === HTML report: four-column layout and count values ===
+
+html_count_column_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(case_example),
         case_example:foo(50),
+        case_example:foo(50),
+        case_example:foo(50),
+        case_example:foo(200),
         Html = lists:flatten(seam_report:html(case_example)),
-        %% Count column should show the execution count for the entered branch
-        ?assert(string:find(Html, "class=\"count\"") =/= nomatch),
-        %% Summary should include Clause row
+        %% The medium branch was entered 3 times
+        ?assert(string:find(Html, "<td class=\"count\">3</td>") =/= nomatch),
+        %% The large branch was entered 1 time
+        ?assert(string:find(Html, "<td class=\"count\">1</td>") =/= nomatch),
+        %% The small branch was never entered (count 0, miss row)
+        ?assert(string:find(Html, "class=\"miss\"") =/= nomatch),
+        %% Summary table has Clause row
         ?assert(string:find(Html, "Clause") =/= nomatch)
     end}.
 
-text_clause_line_test_() ->
+html_all_row_types_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% classify(15) enters clause 1 only. Clause 1 guard is partial
+        %% (true only), clause 3 is miss (never entered).
+        simple_guards:classify(15),
+        Html = lists:flatten(seam_report:html(simple_guards)),
+        ?assert(string:find(Html, "class=\"partial\"") =/= nomatch),
+        ?assert(string:find(Html, "class=\"miss\"") =/= nomatch),
+        %% Plain rows (comments, specs) have empty count column
+        ?assert(string:find(Html, "<td class=\"count\"></td>") =/= nomatch)
+    end}.
+
+html_to_file_test_() ->
     {setup, fun setup/0, fun cleanup/1, fun() ->
         ok = compile_target(simple_guards),
         simple_guards:classify(15),
+        Path = "/tmp/seam_html_to_file_test.html",
+        ok = seam_report:html_to_file(simple_guards, Path),
+        ?assert(filelib:is_file(Path)),
+        {ok, Bin} = file:read_file(Path),
+        Html = binary_to_list(Bin),
+        ?assert(string:find(Html, "<!DOCTYPE html>") =/= nomatch),
+        ?assert(string:find(Html, "simple_guards") =/= nomatch),
+        file:delete(Path)
+    end}.
+
+%%% === Text report content ===
+
+text_report_content_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        simple_guards:classify(5),
+        simple_guards:classify(0),
         Txt = lists:flatten(seam_report:text(simple_guards)),
-        ?assert(string:find(Txt, "Clause Coverage") =/= nomatch)
+        ?assert(string:find(Txt, "Module: simple_guards") =/= nomatch),
+        ?assert(string:find(Txt, "Condition Coverage:") =/= nomatch),
+        ?assert(string:find(Txt, "Decision Coverage:") =/= nomatch),
+        ?assert(string:find(Txt, "Clause Coverage:") =/= nomatch),
+        ?assert(string:find(Txt, "Edge Coverage:") =/= nomatch)
+    end}.
+
+text_untested_section_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% Only hit clause 1 — condition is never_false
+        simple_guards:classify(15),
+        Txt = lists:flatten(seam_report:text(simple_guards)),
+        ?assert(string:find(Txt, "Undertested conditions:") =/= nomatch),
+        ?assert(string:find(Txt, "never false") =/= nomatch)
+    end}.
+
+text_boundary_section_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% classify(7) captures boundary operand for clause 1's X > 10
+        simple_guards:classify(7),
+        Txt = lists:flatten(seam_report:text(simple_guards)),
+        ?assert(string:find(Txt, "Boundary conditions") =/= nomatch)
+    end}.
+
+%%% === Decision meta line numbers ===
+
+decision_meta_lines_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(if_example),
+        Meta = seam_track:decision_meta(if_example),
+        IfMeta = [{Line, Label} || {_, Line, Label} <- Meta,
+                  Label =:= "if branch"],
+        Lines = lists:sort([L || {L, _} <- IfMeta]),
+        %% if_example.erl: line 6 (X > 10), line 7 (X > 0), line 8 (true)
+        ?assertEqual([6, 7, 8], Lines)
+    end}.
+
+%%% === MC/DC vectors ===
+
+mcdc_coverage_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        %% No vectors recorded yet
+        ?assertEqual({error, not_collected},
+                     seam_analyse:mcdc_coverage(simple_guards)),
+        %% Insert independence pair: two vectors differing only in condition 1
+        DecKey = {simple_guards, classify, 1},
+        seam_track:record_vector(DecKey, [true, true], true),
+        seam_track:record_vector(DecKey, [false, true], false),
+        {ok, Result} = seam_analyse:mcdc_coverage(simple_guards),
+        ?assertEqual(satisfied, maps:get(1, Result))
+    end}.
+
+%%% === Export/import all modules ===
+
+export_all_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        ok = compile_target(case_example),
+        simple_guards:classify(15),
+        case_example:foo(50),
+        Path = "/tmp/seam_test_export_all.dat",
+        ok = seam:export(Path),
+        seam:reset(),
+        {ok, Cov1} = seam:analyse(simple_guards, condition),
+        ?assertEqual(#{}, Cov1),
+        ok = seam:import(Path),
+        {ok, Cov2} = seam:analyse(simple_guards, condition),
+        ?assert(maps:size(Cov2) > 0),
+        {ok, Dec} = seam:analyse(case_example, decision),
+        ?assert(maps:size(Dec) > 0),
+        file:delete(Path)
+    end}.
+
+import_error_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ?assertMatch({error, _}, seam:import("/tmp/nonexistent_seam_file.dat"))
+    end}.
+
+%%% === Idempotent start ===
+
+start_idempotent_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ?assertEqual(ok, seam:start()),
+        ?assertEqual(ok, seam:start())
+    end}.
+
+%%% === Zero-condition module ===
+
+zero_conditions_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(nested_case_example),
+        nested_case_example:classify(a, 1),
+        %% No guards anywhere => zero conditions
+        ?assertEqual({0, 0}, seam_analyse:condition_summary(nested_case_example)),
+        ?assertEqual([], seam_analyse:untested_conditions(nested_case_example)),
+        %% Report still works (no division by zero)
+        Txt = lists:flatten(seam_report:text(nested_case_example)),
+        ?assert(string:find(Txt, "Condition Coverage: 0.0%") =/= nomatch)
     end}.
