@@ -17,6 +17,7 @@
 -export([conditions/0, conditions/1, decisions/0, decisions/1]).
 -export([modules/0, register_module/3, unregister_module/1]).
 -export([register_meta/3, meta/1]).
+-export([register_decision_meta/3, decision_meta/1]).
 
 %% @doc Create all ETS tables. Call once at startup.
 -spec init() -> ok.
@@ -30,6 +31,7 @@ init() ->
     ets:new(?SEAM_DISCOVERIES, [named_table, public, set, {write_concurrency, true}]),
     ets:new(?SEAM_OPERANDS,   [named_table, public, set, {write_concurrency, true}]),
     ets:new(?SEAM_EDGES,      [named_table, public, set, {write_concurrency, true}]),
+    ets:new(?SEAM_DECISION_META, [named_table, public, set]),
     ok.
 
 %% @doc Drop all ETS tables.
@@ -37,7 +39,7 @@ init() ->
 destroy() ->
     Tables = [?SEAM_CONDITIONS, ?SEAM_DECISIONS, ?SEAM_MODULES,
               ?SEAM_VECTORS, ?SEAM_META, ?SEAM_DISCOVERIES,
-              ?SEAM_OPERANDS, ?SEAM_EDGES],
+              ?SEAM_OPERANDS, ?SEAM_EDGES, ?SEAM_DECISION_META],
     lists:foreach(fun(T) -> catch ets:delete(T) end, Tables),
     ok.
 
@@ -50,6 +52,7 @@ reset() ->
     ets:delete_all_objects(?SEAM_DISCOVERIES),
     ets:delete_all_objects(?SEAM_OPERANDS),
     ets:delete_all_objects(?SEAM_EDGES),
+    ets:delete_all_objects(?SEAM_DECISION_META),
     ok.
 
 %% @doc Zero counters for a single module. Return error if not compiled.
@@ -60,6 +63,7 @@ reset(Mod) ->
         _  ->
             delete_by_module(?SEAM_CONDITIONS, 4, Mod),
             delete_by_module(?SEAM_DECISIONS, 3, Mod),
+            delete_decision_meta(Mod),
             ok
     end.
 
@@ -212,6 +216,20 @@ meta(Mod) ->
     (_, Acc) -> Acc
     end, [], ?SEAM_META).
 
+%% @doc Store decision metadata (source line and label).
+-spec register_decision_meta(decision_key(), pos_integer(), string()) -> ok.
+register_decision_meta(Key, Line, Label) ->
+    ets:insert(?SEAM_DECISION_META, {Key, Line, Label}),
+    ok.
+
+%% @doc Retrieve all decision metadata for a module.
+-spec decision_meta(module()) -> [{decision_key(), pos_integer(), string()}].
+decision_meta(Mod) ->
+    ets:foldl(fun({{M, _, _} = K, Line, Label}, Acc) when M =:= Mod ->
+        [{K, Line, Label} | Acc];
+    (_, Acc) -> Acc
+    end, [], ?SEAM_DECISION_META).
+
 %%% Internal
 
 fold_pairs(Tab) ->
@@ -233,6 +251,12 @@ eval_cmp('==', L, R)  -> L == R;
 eval_cmp('/=', L, R)  -> L /= R;
 eval_cmp('=:=', L, R) -> L =:= R;
 eval_cmp('=/=', L, R) -> L =/= R.
+
+delete_decision_meta(Mod) ->
+    ets:foldl(fun({{M, _, _} = Key, _, _}, _) when M =:= Mod ->
+        ets:delete(?SEAM_DECISION_META, Key);
+    (_, Acc) -> Acc
+    end, ok, ?SEAM_DECISION_META).
 
 delete_by_module(Tab, KeyArity, Mod) ->
     ets:foldl(fun({CompKey, _}, _) ->

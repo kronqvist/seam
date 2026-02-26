@@ -15,16 +15,20 @@
 text(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
     {DecCov, DecTotal} = seam_analyse:decision_summary(Mod),
+    {ClauseCov, ClauseTotal} = seam_analyse:clause_summary(Mod),
     Untested = seam_analyse:untested_conditions(Mod),
     Boundary = seam_analyse:boundary_conditions(Mod),
     {UniqueEdges, TotalTrans} = seam_analyse:edge_summary(Mod),
     CondPct = pct(CondCov, CondTotal),
     DecPct = pct(DecCov, DecTotal),
+    ClausePct = pct(ClauseCov, ClauseTotal),
     [io_lib:format("Module: ~s~n", [Mod]),
      io_lib:format("Condition Coverage: ~.1f% (~p/~p conditions evaluated both ways)~n",
                    [CondPct, CondCov, CondTotal]),
      io_lib:format("Decision Coverage:  ~.1f% (~p/~p decisions tried both outcomes)~n",
                    [DecPct, DecCov, DecTotal]),
+     io_lib:format("Clause Coverage:    ~.1f% (~p/~p clauses/branches entered)~n",
+                   [ClausePct, ClauseCov, ClauseTotal]),
      io_lib:format("Edge Coverage:      ~p unique edges, ~p total transitions~n",
                    [UniqueEdges, TotalTrans]),
      format_untested(Untested),
@@ -61,15 +65,22 @@ format_boundary_item({{Mod, Fun, Clause, Cond}, Status, {Op, Lhs, Rhs}}) ->
 html(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
     {DecCov, DecTotal} = seam_analyse:decision_summary(Mod),
+    {ClauseCov, ClauseTotal} = seam_analyse:clause_summary(Mod),
     CondPct = pct(CondCov, CondTotal),
     DecPct = pct(DecCov, DecTotal),
+    ClausePct = pct(ClauseCov, ClauseTotal),
     Cov = seam_track:conditions(Mod),
     Meta = seam_track:meta(Mod),
     ByLine = group_meta_by_line(Meta, Cov),
+    Dec = seam_track:decisions(Mod),
+    DecMeta = seam_track:decision_meta(Mod),
+    DecByLine = group_dec_meta_by_line(DecMeta, Dec),
     SrcLines = read_source(Mod),
     [html_header(Mod),
-     summary_table(CondCov, CondTotal, CondPct, DecCov, DecTotal, DecPct),
-     source_table(SrcLines, ByLine),
+     summary_table(CondCov, CondTotal, CondPct,
+                   DecCov, DecTotal, DecPct,
+                   ClauseCov, ClauseTotal, ClausePct),
+     source_table(SrcLines, ByLine, DecByLine),
      html_footer()].
 
 %% @doc Write the HTML report for `Mod' to `Path'.
@@ -126,6 +137,13 @@ group_meta_by_line(Meta, Cov) ->
         maps:update_with(Line, fun(L) -> L ++ [Entry] end, [Entry], Acc)
     end, #{}, Meta).
 
+group_dec_meta_by_line(DecMeta, Dec) ->
+    lists:foldl(fun({Key, Line, Label}, Acc) ->
+        {T, _F} = maps:get(Key, Dec, {0, 0}),
+        Entry = {Key, Label, T},
+        maps:update_with(Line, fun(L) -> L ++ [Entry] end, [Entry], Acc)
+    end, #{}, DecMeta).
+
 %%% HTML generation
 
 html_header(Mod) ->
@@ -166,11 +184,13 @@ css() ->
     ".cond-partial { background: #fff3cd; color: #9a6700; }\n"
     ".cond-none { background: #ffdce0; color: #cf222e; }\n".
 
-summary_table(CondCov, CondTotal, CondPct, DecCov, DecTotal, DecPct) ->
+summary_table(CondCov, CondTotal, CondPct, DecCov, DecTotal, DecPct,
+              ClauseCov, ClauseTotal, ClausePct) ->
     ["<table class=\"summary\">\n",
      "<tr><th>Metric</th><th>Covered</th><th>Total</th><th>%</th></tr>\n",
      summary_row("Condition", CondCov, CondTotal, CondPct),
      summary_row("Decision", DecCov, DecTotal, DecPct),
+     summary_row("Clause", ClauseCov, ClauseTotal, ClausePct),
      "</table>\n"].
 
 summary_row(Label, Cov, Total, Pct) ->
@@ -179,26 +199,39 @@ summary_row(Label, Cov, Total, Pct) ->
                   "<td class=\"~s\">~.1f%</td></tr>\n",
                   [Label, Cov, Total, Class, Pct]).
 
-source_table([], _ByLine) ->
+source_table([], _ByLine, _DecByLine) ->
     "<p><em>Source file not found.</em></p>\n";
-source_table(SrcLines, ByLine) ->
+source_table(SrcLines, ByLine, DecByLine) ->
     ["<h2>Source</h2>\n",
      "<table class=\"source\">\n<tbody>\n",
-     source_rows(SrcLines, ByLine, 1),
+     source_rows(SrcLines, ByLine, DecByLine, 1),
      "</tbody>\n</table>\n"].
 
-source_rows([], _ByLine, _N) -> [];
-source_rows([Line | Rest], ByLine, N) ->
-    Row = source_row(N, Line, maps:get(N, ByLine, [])),
-    [Row | source_rows(Rest, ByLine, N + 1)].
+source_rows([], _ByLine, _DecByLine, _N) -> [];
+source_rows([Line | Rest], ByLine, DecByLine, N) ->
+    Row = source_row(N, Line,
+                     maps:get(N, ByLine, []),
+                     maps:get(N, DecByLine, [])),
+    [Row | source_rows(Rest, ByLine, DecByLine, N + 1)].
 
-source_row(N, Src, []) ->
+%% Three-way dispatch: condition data, decision-only data, or plain.
+source_row(N, Src, [], []) ->
     io_lib:format("<tr>"
                   "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
                   "<td class=\"annot\"></td>"
                   "<td class=\"src\">~s</td>"
                   "</tr>\n", [N, N, N, escape(Src)]);
-source_row(N, Src, Conditions) ->
+source_row(N, Src, [], DecEntries) ->
+    Entered = lists:any(fun({_, _, T}) -> T > 0 end, DecEntries),
+    Class = case Entered of true -> "hit"; false -> "miss" end,
+    Annots = [dec_badge(D) || D <- DecEntries],
+    io_lib:format("<tr class=\"~s\">"
+                  "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
+                  "<td class=\"annot\">~s</td>"
+                  "<td class=\"src\">~s</td>"
+                  "</tr>\n",
+                  [Class, N, N, N, Annots, escape(Src)]);
+source_row(N, Src, Conditions, _DecEntries) ->
     Class = line_class(Conditions),
     Annots = [cond_badge(C) || C <- Conditions],
     io_lib:format("<tr class=\"~s\">"
@@ -227,6 +260,14 @@ cond_badge({_Key, ExprStr, T, F}) ->
     Trimmed = string:trim(ExprStr),
     io_lib:format("<span class=\"cond ~s\" title=\"true:~p false:~p\">~s</span>",
                   [Class, T, F, escape(Trimmed)]).
+
+dec_badge({_Key, Label, T}) ->
+    Class = case T > 0 of
+        true  -> "cond-full";
+        false -> "cond-none"
+    end,
+    io_lib:format("<span class=\"cond ~s\" title=\"entered:~p\">~s</span>",
+                  [Class, T, escape(Label)]).
 
 escape(Str) ->
     lists:flatmap(fun($<) -> "&lt;";

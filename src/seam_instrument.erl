@@ -107,7 +107,8 @@ transform_form(_Mod, Other, _Opts) ->
 transform_fun_clauses(Mod, Fun, Clauses, Opts) ->
     Mode = maps:get(mode, Opts, full),
     Indexed = index_clauses(Clauses, 1),
-    case Mode of
+    put(seam_dec_idx, length(Clauses) + 1),
+    Result = case Mode of
         fast ->
             [instrument_clause_fast(Mod, Fun, Idx, Clause)
              || {Idx, Clause} <- Indexed];
@@ -116,7 +117,9 @@ transform_fun_clauses(Mod, Fun, Clauses, Opts) ->
                             || {Idx, {clause, _, Pats, Guards, _}} <- Indexed],
             [instrument_clause(Mod, Fun, Idx, Clause, AllGuardInfo)
              || {Idx, Clause} <- Indexed]
-    end.
+    end,
+    erase(seam_dec_idx),
+    Result.
 
 index_clauses([], _) -> [];
 index_clauses([C | Cs], N) -> [{N, C} | index_clauses(Cs, N + 1)].
@@ -133,6 +136,8 @@ pat_var(_) -> complex.
 instrument_clause(Mod, Fun, ClauseIdx,
                   {clause, Anno, Pats, Guards, Body},
                   AllGuardInfo) ->
+    seam_track:register_decision_meta(
+        {Mod, Fun, ClauseIdx}, anno_line(Anno), "clause"),
     {Pats1, FreshVars} = freshen_wildcards(Pats, ClauseIdx),
     MyVars = extract_clause_vars(Pats1),
     PriorTracking = build_prior_tracking(Mod, Fun, ClauseIdx,
@@ -155,6 +160,8 @@ instrument_clause(Mod, Fun, ClauseIdx,
 
 instrument_clause_fast(Mod, Fun, ClauseIdx,
                        {clause, Anno, Pats, Guards, Body}) ->
+    seam_track:register_decision_meta(
+        {Mod, Fun, ClauseIdx}, anno_line(Anno), "clause"),
     OwnCondKeys = guard_cond_keys(Mod, Fun, ClauseIdx, Guards),
     GuardConds = flatten_guard_conds(Guards),
     OwnTracking = build_own_tracking(Anno, OwnCondKeys, GuardConds) ++
@@ -296,13 +303,12 @@ conj_keys(Mod, Fun, Clause, [Test | Rest], Idx) ->
     {[Key | RestKeys], NextIdx}.
 
 expr_line(Expr) ->
-    Anno = element(2, Expr),
-    case Anno of
-        N when is_integer(N) -> N;
-        {L, _} when is_integer(L) -> L;
-        _ when is_list(Anno) -> proplists:get_value(location, Anno, 0);
-        _ -> 0
-    end.
+    anno_line(element(2, Expr)).
+
+anno_line(N) when is_integer(N) -> N;
+anno_line({L, _}) when is_integer(L) -> L;
+anno_line(Anno) when is_list(Anno) -> proplists:get_value(location, Anno, 0);
+anno_line(_) -> 0.
 
 expr_to_string(Expr) ->
     try lists:flatten(erl_pp:expr(Expr))
@@ -462,43 +468,59 @@ transform_expr(Mode, Ctx, {cons, A, H, T}) ->
 transform_expr(Mode, Ctx, {block, A, Body}) ->
     {block, A, transform_body(Mode, Ctx, Body)};
 transform_expr(Mode, Ctx, {'fun', A, {clauses, Cs}}) ->
-    %% Save/restore body ctx to prevent cross-scope leakage
-    Saved = erase(seam_body_ctx),
+    %% Save/restore body ctx and dec idx to prevent cross-scope leakage
+    SavedCtx = erase(seam_body_ctx),
+    SavedIdx = erase(seam_dec_idx),
     Result = {'fun', A, {clauses, [transform_case_clause(Mode, Ctx, C) || C <- Cs]}},
-    case Saved of
-        undefined -> ok;
-        _ -> put(seam_body_ctx, Saved)
-    end,
+    restore_pd(seam_body_ctx, SavedCtx),
+    restore_pd(seam_dec_idx, SavedIdx),
     Result;
 transform_expr(Mode, Ctx, {named_fun, A, Name, Cs}) ->
-    Saved = erase(seam_body_ctx),
+    SavedCtx = erase(seam_body_ctx),
+    SavedIdx = erase(seam_dec_idx),
     Result = {named_fun, A, Name,
               [transform_case_clause(Mode, Ctx, C) || C <- Cs]},
-    case Saved of
-        undefined -> ok;
-        _ -> put(seam_body_ctx, Saved)
-    end,
+    restore_pd(seam_body_ctx, SavedCtx),
+    restore_pd(seam_dec_idx, SavedIdx),
     Result;
 transform_expr(_Mode, _Ctx, Other) ->
     Other.
 
 transform_case_clause(Mode, Ctx, {clause, Anno, Pats, Guards, Body}) ->
-    {clause, Anno, Pats, Guards, transform_body(Mode, Ctx, Body)}.
+    Body1 = transform_body(Mode, Ctx, Body),
+    Body2 = maybe_inject_branch_dec(Ctx, Anno, "case branch", Body1),
+    {clause, Anno, Pats, Guards, Body2}.
 
 transform_if_clause(Mode, Ctx, {clause, Anno, [], Guards, Body}) ->
-    {clause, Anno, [], Guards, transform_body(Mode, Ctx, Body)}.
+    Body1 = transform_body(Mode, Ctx, Body),
+    Body2 = maybe_inject_branch_dec(Ctx, Anno, "if branch", Body1),
+    {clause, Anno, [], Guards, Body2}.
 
 %%% === Body key allocation ===
 
 alloc_body_key(Op, Anno) ->
     {Mod, Fun, ClauseIdx, NextIdx} = get(seam_body_ctx),
     Key = {Mod, Fun, ClauseIdx, NextIdx},
-    Line = case Anno of
-        N when is_integer(N) -> N;
-        {L, _} when is_integer(L) -> L;
-        _ when is_list(Anno) -> proplists:get_value(location, Anno, 0);
-        _ -> 0
-    end,
-    seam_track:register_meta(Key, Line, atom_to_list(Op)),
+    seam_track:register_meta(Key, anno_line(Anno), atom_to_list(Op)),
     put(seam_body_ctx, {Mod, Fun, ClauseIdx, NextIdx + 1}),
     {Key, NextIdx}.
+
+%%% === Branch decision injection ===
+
+alloc_dec_idx() ->
+    Idx = get(seam_dec_idx),
+    put(seam_dec_idx, Idx + 1),
+    Idx.
+
+maybe_inject_branch_dec({Mod, Fun}, Anno, Label, Body) ->
+    case get(seam_dec_idx) of
+        undefined -> Body;
+        _ ->
+            Idx = alloc_dec_idx(),
+            DecKey = {Mod, Fun, Idx},
+            seam_track:register_decision_meta(DecKey, anno_line(Anno), Label),
+            [mk_record_dec(Anno, DecKey, true) | Body]
+    end.
+
+restore_pd(_Key, undefined) -> ok;
+restore_pd(Key, Val) -> put(Key, Val), ok.

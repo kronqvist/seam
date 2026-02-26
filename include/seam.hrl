@@ -9,6 +9,7 @@
 -define(SEAM_DISCOVERIES, seam_discoveries).
 -define(SEAM_OPERANDS,   seam_operands).
 -define(SEAM_EDGES,      seam_edges).
+-define(SEAM_DECISION_META, seam_decision_meta).
 
 -type cond_key()     :: {module(), atom(), pos_integer(), pos_integer()}.
 -type decision_key() :: {module(), atom(), pos_integer()}.

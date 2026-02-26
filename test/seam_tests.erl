@@ -286,3 +286,122 @@ guard_multi_test_() ->
         ?assertEqual({2, 1}, maps:get({simple_guards, classify2, 1, 1}, Cov)),
         ?assertEqual({2, 1}, maps:get({simple_guards, classify2, 1, 2}, Cov))
     end}.
+
+%%% === Decision metadata ===
+
+decision_meta_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        Meta = seam_track:decision_meta(simple_guards),
+        %% classify/1 has 3 clauses, classify2/2 has 3 clauses => 6 clause entries
+        ?assertEqual(6, length(Meta)),
+        %% All should be labelled "clause"
+        ?assert(lists:all(fun({_, _, "clause"}) -> true; (_) -> false end, Meta))
+    end}.
+
+decision_meta_fast_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards, #{mode => fast}),
+        Meta = seam_track:decision_meta(simple_guards),
+        ?assertEqual(6, length(Meta))
+    end}.
+
+%%% === Case/if branch instrumentation ===
+
+case_branch_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(case_example),
+        %% Semantics preserved
+        ?assertEqual(medium, case_example:foo(50)),
+        ?assertEqual(large,  case_example:foo(200)),
+        ?assertEqual(small,  case_example:foo(5)),
+        %% Decisions should include case branches beyond the 1 function clause
+        {ok, Dec} = seam:analyse(case_example, decision),
+        ?assert(maps:size(Dec) > 1),
+        %% Decision meta should include case branch entries
+        Meta = seam_track:decision_meta(case_example),
+        CaseMeta = [M || {_, _, "case branch"} = M <- Meta],
+        ?assert(length(CaseMeta) > 0)
+    end}.
+
+nested_case_branch_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(nested_case_example),
+        ?assertEqual(a1, nested_case_example:classify(a, 1)),
+        ?assertEqual(a2, nested_case_example:classify(a, 2)),
+        ?assertEqual(a_other, nested_case_example:classify(a, 99)),
+        ?assertEqual(b1, nested_case_example:classify(b, 1)),
+        ?assertEqual(b_other, nested_case_example:classify(b, 99)),
+        ?assertEqual(other, nested_case_example:classify(c, 0)),
+        {ok, Dec} = seam:analyse(nested_case_example, decision),
+        %% 1 function clause + 3 outer case + 3 inner(a) + 2 inner(b) = 9
+        ?assertEqual(9, maps:size(Dec)),
+        %% Decision meta has all entries regardless of exercise
+        Meta = seam_track:decision_meta(nested_case_example),
+        CaseMeta = [M || {_, _, "case branch"} = M <- Meta],
+        ?assertEqual(8, length(CaseMeta))
+    end}.
+
+if_branch_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(if_example),
+        ?assertEqual(large, if_example:classify(15)),
+        ?assertEqual(small, if_example:classify(5)),
+        ?assertEqual(zero,  if_example:classify(-1)),
+        {ok, Dec} = seam:analyse(if_example, decision),
+        %% 1 function clause + 3 if branches = 4
+        ?assertEqual(4, maps:size(Dec)),
+        Meta = seam_track:decision_meta(if_example),
+        IfMeta = [M || {_, _, "if branch"} = M <- Meta],
+        ?assertEqual(3, length(IfMeta))
+    end}.
+
+%%% === Clause summary ===
+
+clause_summary_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        simple_guards:classify(5),
+        %% 2 of 3 classify clauses entered (not the zero clause),
+        %% plus all 3 classify2 clauses show up as decisions
+        %% but classify2 not called yet so only classify decisions active
+        {Reached, Total} = seam_analyse:clause_summary(simple_guards),
+        ?assert(Reached > 0),
+        ?assert(Total > 0),
+        ?assert(Reached =< Total)
+    end}.
+
+%%% === HTML report colouring ===
+
+html_clause_colouring_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        Html = lists:flatten(seam_report:html(simple_guards)),
+        %% The clause line for classify(X) when X > 10 should be coloured
+        %% (it has both condition AND decision data — condition wins)
+        ?assert(string:find(Html, "class=\"hit\"") =/= nomatch
+            orelse string:find(Html, "class=\"partial\"") =/= nomatch),
+        %% The Clause row should appear in the summary table
+        ?assert(string:find(Html, "Clause") =/= nomatch)
+    end}.
+
+html_decision_only_colouring_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(case_example),
+        case_example:foo(50),
+        Html = lists:flatten(seam_report:html(case_example)),
+        %% Should have decision badge "case branch"
+        ?assert(string:find(Html, "case branch") =/= nomatch),
+        %% Summary should include Clause row
+        ?assert(string:find(Html, "Clause") =/= nomatch)
+    end}.
+
+text_clause_line_test_() ->
+    {setup, fun setup/0, fun cleanup/1, fun() ->
+        ok = compile_target(simple_guards),
+        simple_guards:classify(15),
+        Txt = lists:flatten(seam_report:text(simple_guards)),
+        ?assert(string:find(Txt, "Clause Coverage") =/= nomatch)
+    end}.

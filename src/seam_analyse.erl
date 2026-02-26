@@ -7,7 +7,7 @@
 -module(seam_analyse).
 -include("seam.hrl").
 
--export([condition_summary/1, decision_summary/1]).
+-export([condition_summary/1, decision_summary/1, clause_summary/1]).
 -export([untested_conditions/1]).
 -export([boundary_conditions/1]).
 -export([edge_summary/1]).
@@ -40,6 +40,21 @@ decision_summary(Mod) ->
         end
     end, 0, Dec),
     {Covered, Total}.
+
+%% @doc Count of decisions entered at least once vs total decisions.
+%% Reachability metric: measures clause/branch entry, not both-sides coverage.
+-spec clause_summary(module()) -> {Reached :: non_neg_integer(),
+                                    Total :: non_neg_integer()}.
+clause_summary(Mod) ->
+    Dec = seam_track:decisions(Mod),
+    Total = maps:size(Dec),
+    Reached = maps:fold(fun(_, {T, _}, Acc) ->
+        case T > 0 of
+            true -> Acc + 1;
+            false -> Acc
+        end
+    end, 0, Dec),
+    {Reached, Total}.
 
 %% @doc Conditions stuck on one side: never true or never false.
 -spec untested_conditions(module()) -> [{cond_key(), never_true | never_false}].
