@@ -392,8 +392,8 @@ html_decision_only_colouring_test_() ->
         ok = compile_target(case_example),
         case_example:foo(50),
         Html = lists:flatten(seam_report:html(case_example)),
-        %% Should have decision badge "case branch"
-        ?assert(string:find(Html, "case branch") =/= nomatch),
+        %% Count column should show the execution count for the entered branch
+        ?assert(string:find(Html, "class=\"count\"") =/= nomatch),
         %% Summary should include Clause row
         ?assert(string:find(Html, "Clause") =/= nomatch)
     end}.

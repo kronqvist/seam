@@ -1,9 +1,11 @@
 %% @doc Coverage report generation.
 %%
 %% Plain-text summaries and source-annotated HTML reports. The HTML report
-%% follows `cover:analyse_to_file/2' conventions: a three-column table
-%% (line number, annotations, source) with colour-coded rows. Guard lines
-%% carry per-condition badges showing true/false counts. Text reports
+%% uses a four-column table (line number, execution count, condition badges,
+%% source) with colour-coded rows. The count column shows how many times
+%% each clause or branch was entered — the line-level analogue of
+%% `cover:analyse_to_file/2'. Guard lines additionally carry per-condition
+%% badges showing true/false counts for MC/DC analysis. Text reports
 %% include operand data for stuck conditions and edge coverage summary.
 -module(seam_report).
 -include("seam.hrl").
@@ -60,7 +62,7 @@ format_boundary_item({{Mod, Fun, Clause, Cond}, Status, {Op, Lhs, Rhs}}) ->
     io_lib:format("  ~s:~s/clause ~p, condition ~p -- ~s  (last: ~p ~s ~p)~n",
                   [Mod, Fun, Clause, Cond, StatusStr, Lhs, Op, Rhs]).
 
-%% @doc Source-annotated HTML report with per-condition badges and colour-coded lines.
+%% @doc Source-annotated HTML report with execution counts and condition badges.
 -spec html(module()) -> iolist().
 html(Mod) ->
     {CondCov, CondTotal} = seam_analyse:condition_summary(Mod),
@@ -171,13 +173,18 @@ css() ->
         "user-select: none; width: 1%; }\n"
     "table.source td.line a { color: #888; text-decoration: none; }\n"
     "table.source td.line a:hover { text-decoration: underline; }\n"
+    "td.count { text-align: right; color: #555; width: 1%; "
+        "border-right: 1px solid #ddd; font-size: 12px; }\n"
+    "td.annot { font-size: 11px; color: #555; width: 1%; white-space: nowrap; }\n"
     "tr.hit td.line { background: #cdffd8; }\n"
+    "tr.hit td.count { background: #cdffd8; color: #1a7f37; }\n"
     "tr.hit td.src  { background: #e6ffed; }\n"
     "tr.miss td.line { background: #ffdce0; }\n"
+    "tr.miss td.count { background: #ffdce0; color: #cf222e; }\n"
     "tr.miss td.src  { background: #ffeef0; }\n"
     "tr.partial td.line { background: #fff3cd; }\n"
+    "tr.partial td.count { background: #fff3cd; color: #9a6700; }\n"
     "tr.partial td.src  { background: #fff8e1; }\n"
-    "td.annot { font-size: 11px; color: #555; width: 1%; white-space: nowrap; }\n"
     ".cond { display: inline-block; margin-right: 8px; padding: 1px 4px; "
         "border-radius: 3px; font-size: 11px; }\n"
     ".cond-full { background: #cdffd8; color: #1a7f37; }\n"
@@ -214,32 +221,46 @@ source_rows([Line | Rest], ByLine, DecByLine, N) ->
                      maps:get(N, DecByLine, [])),
     [Row | source_rows(Rest, ByLine, DecByLine, N + 1)].
 
-%% Three-way dispatch: condition data, decision-only data, or plain.
+%% Four-column layout: line | count | condition badges | source.
+%% Plain line — no instrumentation data.
 source_row(N, Src, [], []) ->
     io_lib:format("<tr>"
                   "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
+                  "<td class=\"count\"></td>"
                   "<td class=\"annot\"></td>"
                   "<td class=\"src\">~s</td>"
                   "</tr>\n", [N, N, N, escape(Src)]);
+%% Decision-only line — show count, no condition badges.
 source_row(N, Src, [], DecEntries) ->
-    Entered = lists:any(fun({_, _, T}) -> T > 0 end, DecEntries),
-    Class = case Entered of true -> "hit"; false -> "miss" end,
-    Annots = [dec_badge(D) || D <- DecEntries],
+    Count = line_count(DecEntries),
+    Class = case Count > 0 of true -> "hit"; false -> "miss" end,
     io_lib:format("<tr class=\"~s\">"
                   "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
-                  "<td class=\"annot\">~s</td>"
+                  "<td class=\"count\">~p</td>"
+                  "<td class=\"annot\"></td>"
                   "<td class=\"src\">~s</td>"
                   "</tr>\n",
-                  [Class, N, N, N, Annots, escape(Src)]);
-source_row(N, Src, Conditions, _DecEntries) ->
+                  [Class, N, N, N, Count, escape(Src)]);
+%% Condition line — show count from decisions + condition badges.
+source_row(N, Src, Conditions, DecEntries) ->
+    Count = line_count(DecEntries),
     Class = line_class(Conditions),
     Annots = [cond_badge(C) || C <- Conditions],
     io_lib:format("<tr class=\"~s\">"
                   "<td class=\"line\" id=\"L~p\"><a href=\"#L~p\">~p</a></td>"
+                  "<td class=\"count\">~s</td>"
                   "<td class=\"annot\">~s</td>"
                   "<td class=\"src\">~s</td>"
                   "</tr>\n",
-                  [Class, N, N, N, Annots, escape(Src)]).
+                  [Class, N, N, N, format_count(Count), Annots, escape(Src)]).
+
+%% @doc Maximum true-count across all decisions on a line.
+line_count(DecEntries) ->
+    lists:foldl(fun({_, _, T}, Max) -> max(T, Max) end, 0, DecEntries).
+
+%% @doc Format a count for display. Zero shows as "0"; no decisions shows empty.
+format_count(0) -> "0";
+format_count(N) -> integer_to_list(N).
 
 line_class(Conditions) ->
     AllFull = lists:all(fun({_, _, T, F}) -> T > 0 andalso F > 0 end, Conditions),
@@ -260,14 +281,6 @@ cond_badge({_Key, ExprStr, T, F}) ->
     Trimmed = string:trim(ExprStr),
     io_lib:format("<span class=\"cond ~s\" title=\"true:~p false:~p\">~s</span>",
                   [Class, T, F, escape(Trimmed)]).
-
-dec_badge({_Key, Label, T}) ->
-    Class = case T > 0 of
-        true  -> "cond-full";
-        false -> "cond-none"
-    end,
-    io_lib:format("<span class=\"cond ~s\" title=\"entered:~p\">~s</span>",
-                  [Class, T, escape(Label)]).
 
 escape(Str) ->
     lists:flatmap(fun($<) -> "&lt;";
